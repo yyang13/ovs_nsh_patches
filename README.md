@@ -42,5 +42,5 @@ Test network topology
 
 Openflow tables
 ---------------
-[test-flows-host1.txt]
-[test-flows-host2.txt]
+- [test-flows-host1.txt]
+- [test-flows-host2.txt]

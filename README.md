@@ -22,14 +22,20 @@ $ git clone https://github.com/openvswitch/ovs.git
 $ cd ovs
 
 $ git reset 7d433ae57ebb90cd68e8fa948a096f619ac4e2d8
+
 $ cp ../ovs_nsh_patches/*.patch ./
+
 $ git am *.patch
 
 How to build
 ------------
+```
 $ ./boot.sh
+
 $ ./configure --with-linux=/lib/modules/`uname -r`/build
+
 $ make
+```
 
 If you want to overwrite local ovs installation, please also run it, but please be careful.
 

@@ -1,0 +1,2746 @@
+From bd251cb247ac44e4362215da826e9bf1d6c61f27 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 13 Apr 2016 11:15:42 +0800
+Subject: [PATCH 2/5] ovs-nsh: support push and pop actions for vxlan-gpe and
+ Ethernet nsh
+
+Signed-off-by: Mengke Liu <mengke.liu@intel.com>
+Signed-off-by: Ricky Li <ricky.li@intel.com>
+Signed-off-by: Johnson Li <johnson.li@intel.com>
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/actions.c                                |  73 ++++
+ datapath/datapath.h                               |   2 +
+ datapath/flow.c                                   | 107 ++++++
+ datapath/flow.h                                   |  15 +
+ datapath/flow_netlink.c                           |  81 ++++-
+ datapath/linux/compat/include/linux/openvswitch.h | 174 +++++++++
+ datapath/linux/compat/include/net/vxlan.h         |   5 +-
+ lib/dpif-netdev.c                                 |   4 +
+ lib/dpif.c                                        |   4 +
+ lib/flow.c                                        |  19 +
+ lib/flow.h                                        |  21 +-
+ lib/match.c                                       | 190 ++++++++++
+ lib/match.h                                       |  24 ++
+ lib/meta-flow.c                                   | 256 ++++++++++++-
+ lib/meta-flow.h                                   | 174 +++++++++
+ lib/netdev-vport.c                                |  10 +-
+ lib/nx-match.c                                    |  19 +
+ lib/odp-execute.c                                 |  10 +
+ lib/odp-util.c                                    | 417 +++++++++++++++++++++-
+ lib/odp-util.h                                    |  10 +-
+ lib/ofp-actions.c                                 | 154 +++++++-
+ lib/ofp-actions.h                                 |   6 +
+ ofproto/ofproto-dpif-sflow.c                      |   2 +
+ ofproto/ofproto-dpif-upcall.c                     |  19 +
+ ofproto/ofproto-dpif-xlate.c                      |  22 ++
+ tests/ofproto.at                                  |  13 +-
+ tests/tunnel.at                                   | 157 ++++++++
+ 27 files changed, 1976 insertions(+), 12 deletions(-)
+
+diff --git a/datapath/actions.c b/datapath/actions.c
+index dcf8591..16fc58f 100644
+--- a/datapath/actions.c
++++ b/datapath/actions.c
+@@ -252,6 +252,63 @@ static int push_vlan(struct sk_buff *skb, struct sw_flow_key *key,
+ 			     ntohs(vlan->vlan_tci) & ~VLAN_TAG_PRESENT);
+ }
+ 
++static int pop_nsh(struct sk_buff *skb, struct sw_flow_key *key)
++{
++	if (!pskb_may_pull(skb, NSH_M_TYPE1_LEN))
++		return -ENOMEM;
++	else
++		__skb_pull(skb, NSH_M_TYPE1_LEN);
++
++	return 0;
++}
++
++static int push_nsh(struct sk_buff *skb, struct sw_flow_key *key,
++		     const struct ovs_action_push_nsh *nsh)
++{
++
++	if (nsh->nsh_mdtype == NSH_M_TYPE1) {
++		if (skb_cow_head(skb, NSH_M_TYPE1_LEN) < 0)
++		return -ENOMEM;
++
++		skb_push(skb, NSH_M_TYPE1_LEN);
++		OVS_CB(skb)->nsh_header = skb->data;
++		memcpy(OVS_CB(skb)->nsh_header, nsh->header, NSH_M_TYPE1_LEN);
++	}
++	else
++		return -EINVAL;
++
++	return 0;
++}
++
++static int pop_eth(struct sk_buff *skb, struct sw_flow_key *key)
++{
++	if (!pskb_may_pull(skb, ENCAP_ETH_PUSH_HEADER_SIZE))
++		return -ENOMEM;
++	else
++		__skb_pull(skb, ENCAP_ETH_PUSH_HEADER_SIZE);
++
++	return 0;
++}
++
++static int push_eth(struct sk_buff *skb, struct sw_flow_key *key,
++		     const struct ovs_action_push_eth *encap_eth)
++{
++	if (encap_eth->encap_eth_type == htons(ETH_P_NSH)) {
++		if (skb_cow_head(skb, ENCAP_ETH_PUSH_HEADER_SIZE) < 0)
++			return -ENOMEM;
++
++		skb_push(skb, ENCAP_ETH_PUSH_HEADER_SIZE);
++		OVS_CB(skb)->encap_eth_header = skb->data;
++		memcpy(OVS_CB(skb)->encap_eth_header, encap_eth->header, ENCAP_ETH_PUSH_HEADER_SIZE);
++	}
++	else {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++
+ /* 'src' is already properly masked. */
+ static void ether_addr_copy_masked(u8 *dst_, const u8 *src_, const u8 *mask_)
+ {
+@@ -1079,6 +1136,22 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			err = pop_vlan(skb, key);
+ 			break;
+ 
++		case OVS_ACTION_ATTR_PUSH_NSH:
++			err = push_nsh(skb, key, nla_data(a));
++			break;
++
++		case OVS_ACTION_ATTR_POP_NSH:
++			err = pop_nsh(skb, key);
++			break;
++
++		case OVS_ACTION_ATTR_PUSH_ETH:
++			err = push_eth(skb, key, nla_data(a));
++			break;
++
++		case OVS_ACTION_ATTR_POP_ETH:
++			err = pop_eth(skb, key);
++			break;
++
+ 		case OVS_ACTION_ATTR_RECIRC:
+ 			err = execute_recirc(dp, skb, key, a, rem);
+ 			if (nla_is_last(a, rem)) {
+diff --git a/datapath/datapath.h b/datapath/datapath.h
+index ceb3372..b2d5fcd 100644
+--- a/datapath/datapath.h
++++ b/datapath/datapath.h
+@@ -102,6 +102,8 @@ struct datapath {
+ struct ovs_skb_cb {
+ 	struct vport		*input_vport;
+ 	u16			mru;
++	struct nsh_hdr		*nsh_header;
++	struct encap_eth_hdr	*encap_eth_header;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
+ 
+diff --git a/datapath/flow.c b/datapath/flow.c
+index c97c9c9..67b2f1d 100644
+--- a/datapath/flow.c
++++ b/datapath/flow.c
+@@ -44,6 +44,7 @@
+ #include <net/ipv6.h>
+ #include <net/mpls.h>
+ #include <net/ndisc.h>
++#include <net/vxlan.h>
+ 
+ #include "datapath.h"
+ #include "conntrack.h"
+@@ -318,6 +319,32 @@ static int parse_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ 	return 0;
+ }
+ 
++static int parse_nsh(struct sk_buff *skb, struct sw_flow_key *key){
++	struct nsh_hdr *nsh_hdr = (struct nsh_hdr *)skb->data;
++	OVS_CB(skb)->nsh_header = nsh_hdr;
++	key->nsh.nsh_mdtype = nsh_hdr->base.mdtype;
++	if (key->nsh.nsh_mdtype != NSH_M_TYPE1)
++		return -EPERM;
++	key->nsh.nsh_np = nsh_hdr->base.proto;
++	key->nsh.nsi = nsh_hdr->base.svc_idx;
++	key->nsh.nsp = nsh_hdr->base.path_hdr << 8;
++	key->nsh.nshc1 = nsh_hdr->ctx.nshc1;
++	key->nsh.nshc2 = nsh_hdr->ctx.nshc2;
++	key->nsh.nshc3 = nsh_hdr->ctx.nshc3;
++	key->nsh.nshc4 = nsh_hdr->ctx.nshc4;
++	return 0;
++}
++
++static void parse_encap_eth(struct sk_buff *skb, struct sw_flow_key *key){
++	struct encap_eth_hdr *encap_eth_header = (struct encap_eth_hdr *)skb->data;
++	OVS_CB(skb)->encap_eth_header = encap_eth_header;
++	key->encap_eth.encap_eth_type = encap_eth_header->encap_eth_type;
++	ether_addr_copy(key->encap_eth.encap_eth_src, encap_eth_header->encap_eth_src);
++	ether_addr_copy(key->encap_eth.encap_eth_dst, encap_eth_header->encap_eth_dst);
++
++	return;
++}
++
+ static __be16 parse_ethertype(struct sk_buff *skb)
+ {
+ 	struct llc_snap_hdr {
+@@ -457,6 +484,24 @@ static int key_extract(struct sk_buff *skb, struct sw_flow_key *key)
+ 	int error;
+ 	struct ethhdr *eth;
+ 
++	/* Extract ethernet+nsh if ethernet type is 0x894F */
++	eth = (struct ethhdr *)skb->data;
++	if (eth->h_proto == htons(ETH_P_NSH)) {
++		parse_encap_eth(skb, key);
++		__skb_pull(skb, ENCAP_ETH_LEN);
++
++		if (unlikely(parse_nsh(skb, key)))
++			return -EINVAL;
++		if (key->nsh.nsh_mdtype == NSH_M_TYPE1 && key->nsh.nsh_np == NSH_P_ETHERNET) {
++			__skb_pull(skb, NSH_M_TYPE1_LEN);
++		} else {
++			return -EINVAL;
++		}
++	} else {
++		void *encap_eth_hdr = &(key->encap_eth);
++		memset(encap_eth_hdr, 0, ENCAP_ETH_LEN);
++	}
++
+ 	/* Flags are always used as part of stats */
+ 	key->tp.flags = 0;
+ 
+@@ -676,11 +721,54 @@ static int key_extract(struct sk_buff *skb, struct sw_flow_key *key)
+ 			}
+ 		}
+ 	}
++
++	if (key->encap_eth.encap_eth_type == htons(ETH_P_NSH))
++		__skb_push(skb, ENCAP_ETH_LEN + NSH_M_TYPE1_LEN);
++
++	return 0;
++}
++
++static void ovs_key_nsh_init(struct sw_flow_key *key, __u16 len) {
++	void *nsh_hdr = &(key->nsh);
++	memset(nsh_hdr, 0, len);
++}
++
++static int nsh_extract(struct sk_buff *skb, struct sw_flow_key *key) {
++	int ret;
++
++	/* only support NSH MD tpye1 */
++	if (unlikely(parse_nsh(skb, key)))
++		return -EINVAL;
++	if (key->nsh.nsh_mdtype == NSH_M_TYPE1) {
++		__skb_pull(skb, NSH_M_TYPE1_LEN);
++		if(key->nsh.nsh_np == NSH_P_ETHERNET)
++			ret = key_extract(skb, key);
++		else
++			return -EINVAL;
++		__skb_push(skb, NSH_M_TYPE1_LEN);
++
++		return ret;
++	} else {
++		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++	}
++
+ 	return 0;
+ }
+ 
++static bool is_nsh_header(const void *tun_opts, __be16 tun_flags) {
++	struct vxlan_metadata *md = NULL;
++	if (tun_opts && (tun_flags & TUNNEL_VXLAN_OPT))
++		md = (struct vxlan_metadata *)tun_opts;
++
++	if (md && (md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)
++		return true;
++	else
++		return false;
++}
++
+ int ovs_flow_key_update(struct sk_buff *skb, struct sw_flow_key *key)
+ {
++	ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
+ 	return key_extract(skb, key);
+ }
+ 
+@@ -715,6 +803,15 @@ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ 	key->ovs_flow_hash = 0;
+ 	key->recirc_id = 0;
+ 
++	/* Extract NSH and inner Ethernet if NSH header exists */
++	if (tun_info && is_nsh_header(ip_tunnel_info_opts(tun_info), key->tun_key.tun_flags)) {
++		int ret ;
++		ret = nsh_extract(skb, key);
++		if (key->nsh.nsh_mdtype)
++			return ret;
++	} else {
++		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++	}
+ 	return key_extract(skb, key);
+ }
+ 
+@@ -729,5 +826,15 @@ int ovs_flow_key_extract_userspace(struct net *net, const struct nlattr *attr,
+ 	if (err)
+ 		return err;
+ 
++	/* Extract NSH and inner Ethernet if NSH header exists */
++	if (key && is_nsh_header(key->tun_opts, key->tun_key.tun_flags)) {
++		int ret ;
++		ret = nsh_extract(skb, key);
++		if (key->nsh.nsh_mdtype)
++			return ret;
++	} else {
++		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++	}
++
+ 	return key_extract(skb, key);
+ }
+diff --git a/datapath/flow.h b/datapath/flow.h
+index c0b628a..c8ccd5f 100644
+--- a/datapath/flow.h
++++ b/datapath/flow.h
+@@ -63,6 +63,21 @@ struct sw_flow_key {
+ 		u32	skb_mark;	/* SKB mark. */
+ 		u16	in_port;	/* Input switch port (or DP_MAX_PORTS). */
+ 	} __packed phy; /* Safe when right after 'tun_key'. */
++	struct {
++		u32 nshc1;      /* NSH context C1-C4 */
++		u32 nshc2;
++		u32 nshc3;
++		u32 nshc4;
++		u32 nsp;        /* NSH path id */
++		u8  nsi;        /* NSH index */
++		u8  nsh_mdtype; /* NSH metadata type */
++		u8  nsh_np;     /* NSH next protocol */
++	}__packed nsh; 				/* network service header */
++	struct {
++		u8	encap_eth_src[ETH_ALEN];	/* ENCAP ethernet source address. */
++		u8	encap_eth_dst[ETH_ALEN];	/* ENCAP ethernet destination address. */
++		u16	encap_eth_type;	    		/* ENCAP ethernet type. */
++	} encap_eth;
+ 	u32 ovs_flow_hash;		/* Datapath computed hash value.  */
+ 	u32 recirc_id;			/* Recirculation ID.  */
+ 	struct {
+diff --git a/datapath/flow_netlink.c b/datapath/flow_netlink.c
+index 351a504..ebfae37 100644
+--- a/datapath/flow_netlink.c
++++ b/datapath/flow_netlink.c
+@@ -284,7 +284,7 @@ size_t ovs_key_attr_size(void)
+ 	/* Whenever adding new OVS_KEY_ FIELDS, we should consider
+ 	 * updating this function.
+ 	 */
+-	BUILD_BUG_ON(OVS_KEY_ATTR_TUNNEL_INFO != 26);
++	BUILD_BUG_ON(OVS_KEY_ATTR_TUNNEL_INFO != 28);
+ 
+ 	return    nla_total_size(4)   /* OVS_KEY_ATTR_PRIORITY */
+ 		+ nla_total_size(0)   /* OVS_KEY_ATTR_TUNNEL */
+@@ -297,6 +297,8 @@ size_t ovs_key_attr_size(void)
+ 		+ nla_total_size(2)   /* OVS_KEY_ATTR_CT_ZONE */
+ 		+ nla_total_size(4)   /* OVS_KEY_ATTR_CT_MARK */
+ 		+ nla_total_size(16)  /* OVS_KEY_ATTR_CT_LABELS */
++		+ nla_total_size(24)   /* OVS_KEY_ATTR_NSH */
++		+ nla_total_size(14)   /* OVS_KEY_ATTR_ENCAP_ETH */
+ 		+ nla_total_size(12)  /* OVS_KEY_ATTR_ETHERNET */
+ 		+ nla_total_size(2)   /* OVS_KEY_ATTR_ETHERTYPE */
+ 		+ nla_total_size(4)   /* OVS_KEY_ATTR_VLAN */
+@@ -334,6 +336,8 @@ static const struct ovs_len_tbl ovs_key_lens[OVS_KEY_ATTR_MAX + 1] = {
+ 	[OVS_KEY_ATTR_PRIORITY]	 = { .len = sizeof(u32) },
+ 	[OVS_KEY_ATTR_IN_PORT]	 = { .len = sizeof(u32) },
+ 	[OVS_KEY_ATTR_SKB_MARK]	 = { .len = sizeof(u32) },
++	[OVS_KEY_ATTR_NSH]	 = { .len = sizeof(struct ovs_key_nsh) },
++	[OVS_KEY_ATTR_ENCAP_ETH] = { .len = sizeof(struct ovs_key_encap_eth) },
+ 	[OVS_KEY_ATTR_ETHERNET]	 = { .len = sizeof(struct ovs_key_ethernet) },
+ 	[OVS_KEY_ATTR_VLAN]	 = { .len = sizeof(__be16) },
+ 	[OVS_KEY_ATTR_ETHERTYPE] = { .len = sizeof(__be16) },
+@@ -869,6 +873,42 @@ static int ovs_key_from_nlattrs(struct net *net, struct sw_flow_match *match,
+ 	if (err)
+ 		return err;
+ 
++	if (attrs & (1ULL << OVS_KEY_ATTR_NSH)) {
++		const struct ovs_key_nsh *nsh_key;
++
++				nsh_key = nla_data(a[OVS_KEY_ATTR_NSH]);
++        SW_FLOW_KEY_PUT(match, nsh.nshc1,
++				nsh_key->nshc1, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nshc2,
++				nsh_key->nshc2, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nshc3,
++				nsh_key->nshc3, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nshc4,
++				nsh_key->nshc4, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nsh_mdtype,
++				nsh_key->nsh_mdtype, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nsh_np,
++				nsh_key->nsh_np, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nsp,
++				nsh_key->nsp, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.nsi,
++				nsh_key->nsi, is_mask);
++		attrs &= ~(1ULL << OVS_KEY_ATTR_NSH);
++	}
++
++    if (attrs & (1ULL << OVS_KEY_ATTR_ENCAP_ETH)) {
++        const struct ovs_key_encap_eth *encap_eth_key;
++
++        encap_eth_key = nla_data(a[OVS_KEY_ATTR_ENCAP_ETH]);
++        SW_FLOW_KEY_MEMCPY(match, encap_eth.encap_eth_src,
++				encap_eth_key->encap_eth_src, ETH_ALEN, is_mask);
++        SW_FLOW_KEY_MEMCPY(match, encap_eth.encap_eth_dst,
++				encap_eth_key->encap_eth_dst, ETH_ALEN, is_mask);
++        SW_FLOW_KEY_PUT(match, encap_eth.encap_eth_type,
++				encap_eth_key->encap_eth_type, is_mask);
++        attrs &= ~(1ULL << OVS_KEY_ATTR_ENCAP_ETH);
++    }
++
+ 	if (attrs & (1ULL << OVS_KEY_ATTR_ETHERNET)) {
+ 		const struct ovs_key_ethernet *eth_key;
+ 
+@@ -1386,6 +1426,35 @@ static int __ovs_nla_put_key(const struct sw_flow_key *swkey,
+ 	if (nla_put_u32(skb, OVS_KEY_ATTR_PRIORITY, output->phy.priority))
+ 		goto nla_put_failure;
+ 
++	if ((swkey->nsh.nsh_mdtype || is_mask)) {
++		struct ovs_key_nsh *nsh_key;
++
++		nla = nla_reserve(skb, OVS_KEY_ATTR_NSH, sizeof(*nsh_key));
++		if (!nla)
++			goto nla_put_failure;
++		nsh_key = nla_data(nla);
++		nsh_key->nsi = output->nsh.nsi;
++		nsh_key->nsp = output->nsh.nsp;
++		nsh_key->nsh_mdtype= output->nsh.nsh_mdtype;
++		nsh_key->nsh_np= output->nsh.nsh_np;
++		nsh_key->nshc1= output->nsh.nshc1;
++		nsh_key->nshc2 = output->nsh.nshc2;
++		nsh_key->nshc3 = output->nsh.nshc3;
++		nsh_key->nshc4 = output->nsh.nshc4;
++	}
++
++	if ((swkey->encap_eth.encap_eth_type || is_mask)) {
++		struct ovs_key_encap_eth *encap_eth_key;
++
++		nla = nla_reserve(skb, OVS_KEY_ATTR_ENCAP_ETH, sizeof(*encap_eth_key));
++		if (!nla)
++			goto nla_put_failure;
++		encap_eth_key = nla_data(nla);
++		memcpy(encap_eth_key->encap_eth_src, output->encap_eth.encap_eth_src, ETH_ALEN);
++		memcpy(encap_eth_key->encap_eth_dst, output->encap_eth.encap_eth_dst, ETH_ALEN);
++		encap_eth_key->encap_eth_type= output->encap_eth.encap_eth_type;
++	}
++
+ 	if ((swkey->tun_key.u.ipv4.dst || is_mask)) {
+ 		const void *opts = NULL;
+ 
+@@ -2182,6 +2251,10 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 			[OVS_ACTION_ATTR_POP_MPLS] = sizeof(__be16),
+ 			[OVS_ACTION_ATTR_PUSH_VLAN] = sizeof(struct ovs_action_push_vlan),
+ 			[OVS_ACTION_ATTR_POP_VLAN] = 0,
++			[OVS_ACTION_ATTR_PUSH_NSH] = sizeof(struct ovs_action_push_nsh),
++			[OVS_ACTION_ATTR_POP_NSH] = 0,
++			[OVS_ACTION_ATTR_PUSH_ETH] = sizeof(struct ovs_action_push_eth),
++			[OVS_ACTION_ATTR_POP_ETH] = 0,
+ 			[OVS_ACTION_ATTR_SET] = (u32)-1,
+ 			[OVS_ACTION_ATTR_SET_MASKED] = (u32)-1,
+ 			[OVS_ACTION_ATTR_SAMPLE] = (u32)-1,
+@@ -2226,6 +2299,12 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 			break;
+ 		}
+ 
++		case OVS_ACTION_ATTR_PUSH_NSH:
++		case OVS_ACTION_ATTR_POP_NSH:
++		case OVS_ACTION_ATTR_PUSH_ETH:
++		case OVS_ACTION_ATTR_POP_ETH:
++			break;
++
+ 		case OVS_ACTION_ATTR_POP_VLAN:
+ 			vlan_tci = htons(0);
+ 			break;
+diff --git a/datapath/linux/compat/include/linux/openvswitch.h b/datapath/linux/compat/include/linux/openvswitch.h
+index 44adb81..187bb9b 100644
+--- a/datapath/linux/compat/include/linux/openvswitch.h
++++ b/datapath/linux/compat/include/linux/openvswitch.h
+@@ -42,6 +42,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/if_ether.h>
++#include <asm/byteorder.h>
+ 
+ /**
+  * struct ovs_header - header for OVS Generic Netlink messages.
+@@ -328,6 +329,9 @@ enum ovs_key_attr {
+ 	OVS_KEY_ATTR_ENCAP,	/* Nested set of encapsulated attributes. */
+ 	OVS_KEY_ATTR_PRIORITY,  /* u32 skb->priority */
+ 	OVS_KEY_ATTR_IN_PORT,   /* u32 OVS dp port number */
++	OVS_KEY_ATTR_NSH,		/* struct ovs_key_nsh. Only support NSH MD
++					type 1 now */
++	OVS_KEY_ATTR_ENCAP_ETH,	/* struct ovs_key_encap_eth */
+ 	OVS_KEY_ATTR_ETHERNET,  /* struct ovs_key_ethernet */
+ 	OVS_KEY_ATTR_VLAN,	/* be16 VLAN TCI */
+ 	OVS_KEY_ATTR_ETHERTYPE,	/* be16 Ethernet type */
+@@ -401,6 +405,24 @@ enum ovs_frag_type {
+ 
+ #define OVS_FRAG_TYPE_MAX (__OVS_FRAG_TYPE_MAX - 1)
+ 
++struct ovs_key_nsh {
++	__u32	nshc1;
++	__u32	nshc2;
++	__u32	nshc3;
++	__u32	nshc4;
++	__u32	nsp;
++	__u8	nsi;
++	__u8	nsh_mdtype;
++	__u8	nsh_np;
++	__u8 	reserved;
++};
++
++struct ovs_key_encap_eth {
++	__u8	 encap_eth_src[ETH_ALEN];
++	__u8	 encap_eth_dst[ETH_ALEN];
++	__u16    encap_eth_type;
++};
++
+ struct ovs_key_ethernet {
+ 	__u8	 eth_src[ETH_ALEN];
+ 	__u8	 eth_dst[ETH_ALEN];
+@@ -630,6 +652,154 @@ struct ovs_action_push_vlan {
+ 	__be16 vlan_tci;	/* 802.1Q TCI (VLAN ID and priority). */
+ };
+ 
++/*
++ * Network Service Header:
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |Ver|O|C|R|R|R|R|R|R|    Length   |   MD Type   |  Next Proto   |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                Service Path ID                | Service Index |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * Ver = The version field is used to ensure backward compatibility
++ *       going forward with future NSH updates.  It MUST be set to 0x0
++ *       by the sender, in this first revision of NSH.
++ *
++ * O = OAM. when set to 0x1 indicates that this packet is an operations
++ *     and management (OAM) packet.  The receiving SFF and SFs nodes
++ *     MUST examine the payload and take appropriate action.
++ *
++ * C = context. Indicates that a critical metadata TLV is present.
++ *
++ * Length : total length, in 4-byte words, of NSH including the Base
++ *          Header, the Service Path Header and the optional variable
++ *          TLVs.
++ * MD Type: indicates the format of NSH beyond the mandatory Base Header
++ *          and the Service Path Header.
++ *
++ * Next Protocol: indicates the protocol type of the original packet. A
++ *          new IANA registry will be created for protocol type.
++ *
++ * Service Path Identifier (SPI): identifies a service path.
++ *          Participating nodes MUST use this identifier for Service
++ *          Function Path selection.
++ *
++ * Service Index (SI): provides location within the SFP.
++ *
++ * [0] https://tools.ietf.org/html/draft-ietf-sfc-nsh-01
++ */
++
++struct nsh_base {
++#if defined(__LITTLE_ENDIAN_BITFIELD)
++
++	__u8    reserved_flags1:4;
++	__u8    context_flag:1;
++	__u8    oam_flag:1;
++	__u8    version:2;
++
++	__u8    length:6;
++	__u8    reserved_flags2:2;
++#elif defined(__BIG_ENDIAN_BITFIELD)
++
++	__u8    version:2;
++	__u8    oam_flag:1;
++	__u8    context_flag:1;
++	__u8    reserved_flags1:4;
++
++	__u8    reserved_flags2:2;
++	__u8    length:6;
++#else
++#error "Bitfield Endianess not defined."
++#endif
++	__u8    mdtype;
++	__u8    proto;
++	union {
++		struct {
++			__u8    svc_path[3];
++			__u8    svc_idx;
++		};
++		__be32 path_hdr;
++	};
++};
++
++
++/**
++ * struct nsh_ctx - Keeps track of NSH context data
++ * @c<1-4>: NSH Contexts.
++ */
++struct nsh_ctx {
++	__be32 nshc1;
++	__be32 nshc2;
++	__be32 nshc3;
++	__be32 nshc4;
++};
++
++/**
++ * struct nshdr - Network Service header
++ * @nsh_base: Network Service Base Header.
++ * @nsh_ctx: Network Service Context Header.
++ */
++struct nsh_hdr {
++	struct nsh_base base;
++	struct nsh_ctx ctx;
++};
++
++
++#define ETH_P_NSH        0x894F   /* Ethertype for NSH */
++
++/* NSH Base Header Next Protocol */
++#define NSH_P_IPV4        0x01
++#define NSH_P_IPV6        0x02
++#define NSH_P_ETHERNET    0x03
++
++/* MD Type Registry */
++#define NSH_M_TYPE1     0x01
++#define NSH_M_EXP1      0xFE
++#define NSH_M_EXP2      0xFF
++
++#define NSH_DST_PORT    4790   /* UDP Port for NSH on VXLAN */
++
++#define NSH_M_TYPE1_LEN     24
++
++/* Used for masking nsp and nsi values in field nsp below */
++#define NSH_M_NSP   0x00FFFFFF
++#define NSH_M_NSI   0xFF000000
++
++/* NSH header for MD type 1. Unit is bytes */
++#define NSH_PUSH_TYPE1_HEADER_SIZE 24
++#define NSH_PUSH_HEADER_SIZE 256
++
++#define ENCAP_ETH_LEN     14
++
++/**
++ * struct encap_eth - encap ethernet header for ethernet NSH
++ * @encap_eth_src: encap ethernet source address.
++ * @encap_eth_src: encap ethernet destination address.
++ * @encap_eth_type: encap ethernet type.
++ */
++struct encap_eth_hdr {
++	__u8 encap_eth_dst[ETH_ALEN];
++	__u8 encap_eth_src[ETH_ALEN];
++	__u16 encap_eth_type;
++};
++
++#define ENCAP_ETH_PUSH_HEADER_SIZE 14
++/**
++ * struct ovs_action_push_nsh - %OVS_ACTION_ATTR_PUSH_NSH action argument.
++ * @header
++ */
++struct ovs_action_push_nsh {
++	uint8_t  nsh_mdtype;
++	uint8_t  header[NSH_PUSH_HEADER_SIZE];
++};
++
++/**
++ * struct ovs_action_push_nsh - %OVS_ACTION_ATTR_PUSH_NSH action argument.
++ * @header
++ */
++struct ovs_action_push_eth {
++	uint16_t  encap_eth_type;
++	uint8_t  header[ENCAP_ETH_PUSH_HEADER_SIZE];
++};
++
+ /* Data path hash algorithm for computing Datapath hash.
+  *
+  * The algorithm type only specifies the fields in a flow
+@@ -793,6 +963,10 @@ enum ovs_action_attr {
+ 	OVS_ACTION_ATTR_SET,          /* One nested OVS_KEY_ATTR_*. */
+ 	OVS_ACTION_ATTR_PUSH_VLAN,    /* struct ovs_action_push_vlan. */
+ 	OVS_ACTION_ATTR_POP_VLAN,     /* No argument. */
++	OVS_ACTION_ATTR_PUSH_NSH,     /* struct ovs_action_push_nsh. */
++	OVS_ACTION_ATTR_POP_NSH,      /* No argument. */
++	OVS_ACTION_ATTR_PUSH_ETH,     /* struct ovs_action_push_eth. */
++	OVS_ACTION_ATTR_POP_ETH,      /* No argument. */
+ 	OVS_ACTION_ATTR_SAMPLE,       /* Nested OVS_SAMPLE_ATTR_*. */
+ 	OVS_ACTION_ATTR_RECIRC,       /* u32 recirc_id. */
+ 	OVS_ACTION_ATTR_HASH,	      /* struct ovs_action_hash. */
+diff --git a/datapath/linux/compat/include/net/vxlan.h b/datapath/linux/compat/include/net/vxlan.h
+index 2bfc3f8..3aeac88 100644
+--- a/datapath/linux/compat/include/net/vxlan.h
++++ b/datapath/linux/compat/include/net/vxlan.h
+@@ -85,7 +85,7 @@ struct vxlanhdr_gbp {
+ #define VXLAN_GBP_ID_MASK		(0xFFFF)
+ 
+ /*
+- * VXLAN Generic Protocol Extension Extension:
++ * VXLAN Generic Protocol Extension:
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |R|R|Ver|I|P|R|O|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|  Next Proto   |
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+@@ -103,6 +103,9 @@ struct vxlanhdr_gbp {
+  * O = OAM Flag Bit. The O bit is set to indicate that the packet
+  *     is an OAM packet.
+  *
++ * Next Protocol = This 8 bit field indicates the protocol header
++ *     immediately following the VXLAN GPE header.
++ *
+  * [1] https://www.ietf.org/id/draft-ietf-nvo3-vxlan-gpe-01.txt
+  */
+ 
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 119dc2d..8e67bfd 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -3874,6 +3874,10 @@ dp_execute_cb(void *aux_, struct dp_packet **packets, int cnt,
+         VLOG_WARN("Cannot execute conntrack action in userspace.");
+         break;
+ 
++    case OVS_ACTION_ATTR_PUSH_NSH:
++    case OVS_ACTION_ATTR_POP_NSH:
++    case OVS_ACTION_ATTR_PUSH_ETH:
++    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_PUSH_MPLS:
+diff --git a/lib/dpif.c b/lib/dpif.c
+index a784de7..b5265c4 100644
+--- a/lib/dpif.c
++++ b/lib/dpif.c
+@@ -1139,6 +1139,10 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet **packets, int cnt,
+     }
+ 
+     case OVS_ACTION_ATTR_HASH:
++    case OVS_ACTION_ATTR_PUSH_NSH:
++    case OVS_ACTION_ATTR_POP_NSH:
++    case OVS_ACTION_ATTR_PUSH_ETH:
++    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_PUSH_MPLS:
+diff --git a/lib/flow.c b/lib/flow.c
+index d24bdc9..fc8b98c 100644
+--- a/lib/flow.c
++++ b/lib/flow.c
+@@ -1289,6 +1289,25 @@ void flow_wildcards_init_for_packet(struct flow_wildcards *wc,
+         WC_MASK_FIELD(wc, tunnel.tun_id);
+     }
+ 
++    /* NSH fields wildcarded */
++    if (flow->nsh_mdtype) {
++        WC_MASK_FIELD(wc, nshc1);
++        WC_MASK_FIELD(wc, nshc2);
++        WC_MASK_FIELD(wc, nshc3);
++        WC_MASK_FIELD(wc, nshc4);
++        WC_MASK_FIELD(wc, nsh_mdtype);
++        WC_MASK_FIELD(wc, nsh_np);
++        WC_MASK_FIELD(wc, nsp);
++        WC_MASK_FIELD(wc, nsi);
++    }
++
++    /* ENCAP Eth wildcarded */
++    if (flow->encap_eth_type) {
++        WC_MASK_FIELD(wc, encap_eth_src);
++        WC_MASK_FIELD(wc, encap_eth_dst);
++        WC_MASK_FIELD(wc, encap_eth_type);
++    }
++
+     /* metadata, regs, and conj_id wildcarded. */
+ 
+     WC_MASK_FIELD(wc, skb_priority);
+diff --git a/lib/flow.h b/lib/flow.h
+index dc7130d..a8677b1 100644
+--- a/lib/flow.h
++++ b/lib/flow.h
+@@ -111,6 +111,23 @@ struct flow {
+     ofp_port_t actset_output;   /* Output port in action set. */
+     uint8_t pad2[2];            /* Pad to 64 bits. */
+ 
++    /* NSH (64-bit aligned) */
++    ovs_be32 nshc1;
++    ovs_be32 nshc2;
++    ovs_be32 nshc3;
++    ovs_be32 nshc4;
++    ovs_be32 nsp;
++    uint8_t nsi;
++    uint8_t nsh_mdtype;
++    uint8_t nsh_np;
++    uint8_t pad3;
++
++    /* ENCAP_ETH (64-bit aligned) */
++    struct eth_addr encap_eth_src;     /* Encap ethernet source address. */
++    struct eth_addr encap_eth_dst;     /* Encap ethernet destination address. */
++    ovs_be16 encap_eth_type;           /* Encap ethernet frame type. */
++    uint8_t pad4[2];
++
+     /* L2, Order the same as in the Ethernet header! (64-bit aligned) */
+     struct eth_addr dl_dst;     /* Ethernet destination address. */
+     struct eth_addr dl_src;     /* Ethernet source address. */
+@@ -132,7 +149,7 @@ struct flow {
+     struct eth_addr arp_sha;    /* ARP/ND source hardware address. */
+     struct eth_addr arp_tha;    /* ARP/ND target hardware address. */
+     ovs_be16 tcp_flags;         /* TCP flags. With L3 to avoid matching L4. */
+-    ovs_be16 pad3;              /* Pad to 64 bits. */
++    ovs_be16 pad5;              /* Pad to 64 bits. */
+ 
+     /* L4 (64-bit aligned) */
+     ovs_be16 tp_src;            /* TCP/UDP/SCTP source port/ICMP type. */
+@@ -158,7 +175,7 @@ BUILD_ASSERT_DECL(sizeof(struct flow_tnl) % sizeof(uint64_t) == 0);
+ 
+ /* Remember to update FLOW_WC_SEQ when changing 'struct flow'. */
+ BUILD_ASSERT_DECL(offsetof(struct flow, igmp_group_ip4) + sizeof(uint32_t)
+-                  == sizeof(struct flow_tnl) + 216
++                  == sizeof(struct flow_tnl) + 256
+                   && FLOW_WC_SEQ == 35);
+ 
+ /* Incremental points at which flow classification may be performed in
+diff --git a/lib/match.c b/lib/match.c
+index 52437c9..3db2a2b 100644
+--- a/lib/match.c
++++ b/lib/match.c
+@@ -862,6 +862,152 @@ match_set_nd_target_masked(struct match *match,
+     match->wc.masks.nd_target = *mask;
+ }
+ 
++void
++match_set_nsp_masked(struct match *match, ovs_be32 nsp, ovs_be32 mask)
++{
++    match->wc.masks.nsp = mask;
++    match->flow.nsp = nsp & mask;
++}
++
++void
++match_set_nsi_masked(struct match *match, uint8_t nsi, uint8_t mask)
++{
++    match->wc.masks.nsi = mask;
++    match->flow.nsi = nsi & mask;
++}
++
++void
++match_set_nsh_mdtype_masked(struct match *match, uint8_t nsh_mdtype, uint8_t mask)
++{
++    match->wc.masks.nsh_mdtype = mask;
++    match->flow.nsh_mdtype = nsh_mdtype & mask;
++}
++
++void
++match_set_nsh_np_masked(struct match *match, uint8_t nsh_np, uint8_t mask)
++{
++    match->wc.masks.nsh_np = mask;
++    match->flow.nsh_np = nsh_np & mask;
++}
++
++void
++match_set_encap_eth_src_masked(struct match *match,
++                        const struct eth_addr encap_eth_src,
++                        const struct eth_addr mask)
++{
++    set_eth_masked(encap_eth_src, mask, &match->flow.encap_eth_src, &match->wc.masks.encap_eth_src);
++}
++
++void
++match_set_encap_eth_dst_masked(struct match *match,
++                        const struct eth_addr encap_eth_dst,
++                        const struct eth_addr mask)
++{
++    set_eth_masked(encap_eth_dst, mask, &match->flow.encap_eth_dst, &match->wc.masks.encap_eth_dst);
++}
++
++void
++match_set_encap_eth_type_masked(struct match *match, ovs_be16 encap_eth_type, ovs_be16 mask)
++{
++    match->wc.masks.encap_eth_type = mask;
++    match->flow.encap_eth_type = encap_eth_type & mask;
++}
++
++void
++match_set_nshc1_masked(struct match *match, ovs_be32 nshc1, ovs_be32 mask)
++{
++    match->wc.masks.nshc1 = mask;
++    match->flow.nshc1 = nshc1 & mask;
++}
++
++void
++match_set_nshc2_masked(struct match *match, ovs_be32 nshc2, ovs_be32 mask)
++{
++    match->wc.masks.nshc2 = mask;
++    match->flow.nshc2 = nshc2 & mask;
++}
++
++void
++match_set_nshc3_masked(struct match *match, ovs_be32 nshc3, ovs_be32 mask)
++{
++    match->wc.masks.nshc3 = mask;
++    match->flow.nshc3 = nshc3 & mask;
++}
++
++void
++match_set_nshc4_masked(struct match *match, ovs_be32 nshc4, ovs_be32 mask)
++{
++    match->wc.masks.nshc4 = mask;
++    match->flow.nshc4 = nshc4 & mask;
++}
++
++void
++match_set_nsp(struct match *match, ovs_be32 nsp)
++{
++    match_set_nsp_masked(match, nsp, OVS_BE32_MAX);
++}
++
++void
++match_set_nsi(struct match *match, uint8_t nsi)
++{
++    match_set_nsi_masked(match, nsi, UINT8_MAX);
++}
++
++void
++match_set_nsh_mdtype(struct match *match, uint8_t nsh_mdtype)
++{
++    match_set_nsh_mdtype_masked(match, nsh_mdtype, UINT8_MAX);
++}
++
++void
++match_set_nsh_np(struct match *match, uint8_t nsh_np)
++{
++    match_set_nsh_np_masked(match, nsh_np, UINT8_MAX);
++}
++
++void
++match_set_nshc1(struct match *match, ovs_be32 nshc1)
++{
++    match_set_nshc1_masked(match, nshc1, OVS_BE32_MAX);
++}
++
++void
++match_set_nshc2(struct match *match, ovs_be32 nshc2)
++{
++    match_set_nshc2_masked(match, nshc2, OVS_BE32_MAX);
++}
++
++void
++match_set_nshc3(struct match *match, ovs_be32 nshc3)
++{
++    match_set_nshc3_masked(match, nshc3, OVS_BE32_MAX);
++}
++
++void
++match_set_nshc4(struct match *match, ovs_be32 nshc4)
++{
++    match_set_nshc4_masked(match, nshc4, OVS_BE32_MAX);
++}
++
++void
++match_set_encap_eth_src(struct match *match, const struct eth_addr encap_eth_src)
++{
++    set_eth(encap_eth_src, &match->flow.encap_eth_src, &match->wc.masks.encap_eth_src);
++}
++
++void
++match_set_encap_eth_dst(struct match *match, const struct eth_addr encap_eth_dst)
++{
++    set_eth(encap_eth_dst, &match->flow.encap_eth_dst, &match->wc.masks.encap_eth_dst);
++}
++
++void
++match_set_encap_eth_type(struct match *match, uint16_t encap_eth_type)
++{
++    match_set_encap_eth_type_masked(match, encap_eth_type, UINT16_MAX);
++}
++
++
+ /* Returns true if 'a' and 'b' wildcard the same fields and have the same
+  * values for fixed fields, otherwise false. */
+ bool
+@@ -1155,6 +1301,50 @@ match_format(const struct match *match, struct ds *s, int priority)
+         format_ct_label_masked(s, &f->ct_label, &wc->masks.ct_label);
+     }
+ 
++    if (wc->masks.nsi) {
++        ds_put_format(s, "nsi=%"PRIu8",", f->nsi);
++    }
++
++    if (wc->masks.nsh_mdtype) {
++        ds_put_format(s, "nsh_mdtype=%"PRIu8",", f->nsh_mdtype);
++    }
++
++    if (wc->masks.nsh_np) {
++        ds_put_format(s, "nsh_np=%"PRIu8",", f->nsh_np);
++    }
++
++    if (wc->masks.nsp) {
++        format_be32_masked(s, "nsp", f->nsp,
++                             wc->masks.nsp);
++    }
++
++    if (wc->masks.nshc1) {
++        format_be32_masked(s, "nshc1", f->nshc1,
++                             wc->masks.nshc1);
++    }
++
++    if (wc->masks.nshc2) {
++        format_be32_masked(s, "nshc2", f->nshc2,
++                             wc->masks.nshc2);
++    }
++
++    if (wc->masks.nshc3) {
++        format_be32_masked(s, "nshc3", f->nshc3,
++                             wc->masks.nshc3);
++    }
++
++    if (wc->masks.nshc4) {
++        format_be32_masked(s, "nshc4", f->nshc4,
++                             wc->masks.nshc4);
++    }
++
++    if (wc->masks.encap_eth_type) {
++        ds_put_format(s, "encap_eth_type=%"PRIu16",", f->encap_eth_type);
++    }
++
++    format_eth_masked(s, "encap_eth_src", f->encap_eth_src, wc->masks.encap_eth_src);
++    format_eth_masked(s, "encap_eth_dst", f->encap_eth_dst, wc->masks.encap_eth_dst);
++
+     if (wc->masks.dl_type) {
+         skip_type = true;
+         if (f->dl_type == htons(ETH_TYPE_IP)) {
+diff --git a/lib/match.h b/lib/match.h
+index 48aa0b1..529350e 100644
+--- a/lib/match.h
++++ b/lib/match.h
+@@ -165,6 +165,30 @@ void match_set_nd_target(struct match *, const struct in6_addr *);
+ void match_set_nd_target_masked(struct match *, const struct in6_addr *,
+                                 const struct in6_addr *);
+ 
++void match_set_nsp_masked(struct match *, ovs_be32 nsp, ovs_be32 mask);
++void match_set_nsi_masked(struct match *match, uint8_t nsi, uint8_t mask);
++void match_set_nsh_mdtype_masked(struct match *match, uint8_t nsh_mdtype, uint8_t mask);
++void match_set_nsh_np_masked(struct match *match, uint8_t nsh_np, uint8_t mask);
++void match_set_nshc1_masked(struct match *, ovs_be32 nshc1, ovs_be32 mask);
++void match_set_nshc2_masked(struct match *, ovs_be32 nshc2, ovs_be32 mask);
++void match_set_nshc3_masked(struct match *, ovs_be32 nshc3, ovs_be32 mask);
++void match_set_nshc4_masked(struct match *, ovs_be32 nshc4, ovs_be32 mask);
++void match_set_encap_eth_src_masked(struct match *match, const struct eth_addr encap_eth_src, const struct eth_addr mask);
++void match_set_encap_eth_dst_masked(struct match *match, const struct eth_addr encap_eth_dst, const struct eth_addr mask);
++void match_set_encap_eth_type_masked(struct match *match, ovs_be16 encap_eth_type, ovs_be16 mask);
++
++void match_set_nsp(struct match *, ovs_be32 nsp);
++void match_set_nsi(struct match *match, uint8_t nsi);
++void match_set_nsh_mdtype(struct match *match, uint8_t nsh_mdtype);
++void match_set_nsh_np(struct match *match, uint8_t nsh_np);
++void match_set_nshc1(struct match *, ovs_be32 nshc1);
++void match_set_nshc2(struct match *, ovs_be32 nshc2);
++void match_set_nshc3(struct match *, ovs_be32 nshc3);
++void match_set_nshc4(struct match *, ovs_be32 nshc4);
++void match_set_encap_eth_src(struct match *match, const struct eth_addr encap_eth_src);
++void match_set_encap_eth_dst(struct match *match, const struct eth_addr encap_eth_dst);
++void match_set_encap_eth_type(struct match *match, uint16_t encap_eth_type);
++
+ bool match_equal(const struct match *, const struct match *);
+ uint32_t match_hash(const struct match *, uint32_t basis);
+ 
+diff --git a/lib/meta-flow.c b/lib/meta-flow.c
+index ab77fca..648a753 100644
+--- a/lib/meta-flow.c
++++ b/lib/meta-flow.c
+@@ -243,7 +243,28 @@ mf_is_all_wild(const struct mf_field *mf, const struct flow_wildcards *wc)
+         return !flow_get_xreg(&wc->masks, mf->id - MFF_XREG0);
+     case MFF_ACTSET_OUTPUT:
+         return !wc->masks.actset_output;
+-
++    case MFF_NSP:
++        return !wc->masks.nsp;
++    case MFF_NSI:
++        return !wc->masks.nsi;
++    case MFF_NSH_C1:
++        return !wc->masks.nshc1;
++    case MFF_NSH_C2:
++        return !wc->masks.nshc2;
++    case MFF_NSH_C3:
++        return !wc->masks.nshc3;
++    case MFF_NSH_C4:
++        return !wc->masks.nshc4;
++    case MFF_NSH_MDTYPE:
++        return !wc->masks.nsh_mdtype;
++    case MFF_NSH_NP:
++        return !wc->masks.nsh_np;
++    case MFF_ENCAP_ETH_SRC:
++        return eth_addr_is_zero(wc->masks.encap_eth_src);
++    case MFF_ENCAP_ETH_DST:
++        return eth_addr_is_zero(wc->masks.encap_eth_dst);
++    case MFF_ENCAP_ETH_TYPE:
++        return !wc->masks.encap_eth_type;
+     case MFF_ETH_SRC:
+         return eth_addr_is_zero(wc->masks.dl_src);
+     case MFF_ETH_DST:
+@@ -557,6 +578,17 @@ mf_is_value_valid(const struct mf_field *mf, const union mf_value *value)
+     case MFF_ICMPV6_TYPE:
+     case MFF_ICMPV6_CODE:
+     case MFF_ND_TARGET:
++    case MFF_NSP:
++    case MFF_NSI:
++    case MFF_NSH_MDTYPE:
++    case MFF_NSH_NP:
++    case MFF_NSH_C1:
++    case MFF_NSH_C2:
++    case MFF_NSH_C3:
++    case MFF_NSH_C4:
++    case MFF_ENCAP_ETH_SRC:
++    case MFF_ENCAP_ETH_DST:
++    case MFF_ENCAP_ETH_TYPE:
+     case MFF_ND_SLL:
+     case MFF_ND_TLL:
+         return true;
+@@ -716,6 +748,50 @@ mf_get_value(const struct mf_field *mf, const struct flow *flow,
+         value->be64 = htonll(flow_get_xreg(flow, mf->id - MFF_XREG0));
+         break;
+ 
++    case MFF_NSP:
++        value->be32 = flow->nsp;
++        break;
++
++    case MFF_NSI:
++        value->u8 = flow->nsi;
++        break;
++
++    case MFF_NSH_C1:
++        value->be32 = flow->nshc1;
++        break;
++
++    case MFF_NSH_C2:
++        value->be32 = flow->nshc2;
++        break;
++
++    case MFF_NSH_C3:
++        value->be32 = flow->nshc3;
++        break;
++
++    case MFF_NSH_C4:
++        value->be32 = flow->nshc4;
++        break;
++
++    case MFF_NSH_MDTYPE:
++        value->u8 = flow->nsh_mdtype;
++        break;
++
++    case MFF_NSH_NP:
++        value->u8 = flow->nsh_np;
++        break;
++
++    case MFF_ENCAP_ETH_SRC:
++        value->mac = flow->encap_eth_src;
++        break;
++
++    case MFF_ENCAP_ETH_DST:
++        value->mac = flow->encap_eth_dst;
++        break;
++
++    case MFF_ENCAP_ETH_TYPE:
++        value->be16 = flow->encap_eth_type;
++        break;
++
+     case MFF_ETH_SRC:
+         value->mac = flow->dl_src;
+         break;
+@@ -1085,6 +1161,50 @@ mf_set_value(const struct mf_field *mf,
+         match_set_arp_sha(match, value->mac);
+         break;
+ 
++    case MFF_NSP:
++        match_set_nsp(match, value->be32);
++        break;
++
++    case MFF_NSI:
++        match_set_nsi(match, value->u8);
++        break;
++
++    case MFF_NSH_MDTYPE:
++        match_set_nsh_mdtype(match, value->u8);
++        break;
++
++    case MFF_NSH_NP:
++        match_set_nsh_np(match, value->u8);
++        break;
++
++    case MFF_NSH_C1:
++        match_set_nshc1(match, value->be32);
++        break;
++
++    case MFF_NSH_C2:
++        match_set_nshc2(match, value->be32);
++        break;
++
++    case MFF_NSH_C3:
++        match_set_nshc3(match, value->be32);
++        break;
++
++    case MFF_NSH_C4:
++        match_set_nshc4(match, value->be32);
++        break;
++
++    case MFF_ENCAP_ETH_SRC:
++        match_set_encap_eth_src(match, value->mac);
++        break;
++
++    case MFF_ENCAP_ETH_DST:
++        match_set_encap_eth_dst(match, value->mac);
++        break;
++
++    case MFF_ENCAP_ETH_TYPE:
++        match_set_encap_eth_type(match, value->be16);
++        break;
++
+     case MFF_ARP_THA:
+     case MFF_ND_TLL:
+         match_set_arp_tha(match, value->mac);
+@@ -1296,6 +1416,50 @@ mf_set_flow_value(const struct mf_field *mf,
+         flow_set_xreg(flow, mf->id - MFF_XREG0, ntohll(value->be64));
+         break;
+ 
++    case MFF_NSP:
++        flow->nsp = value->be32;
++        break;
++
++    case MFF_NSI:
++        flow->nsi = value->u8;
++        break;
++
++    case MFF_NSH_C1:
++        flow->nshc1 = value->be32;
++        break;
++
++    case MFF_NSH_C2:
++        flow->nshc2 = value->be32;
++        break;
++
++    case MFF_NSH_C3:
++        flow->nshc3 = value->be32;
++        break;
++
++    case MFF_NSH_C4:
++        flow->nshc4 = value->be32;
++        break;
++
++    case MFF_NSH_MDTYPE:
++        flow->nsh_mdtype = value->u8;
++        break;
++
++    case MFF_NSH_NP:
++        flow->nsh_np = value->u8;
++        break;
++
++    case MFF_ENCAP_ETH_SRC:
++        flow->encap_eth_src = value->mac;
++        break;
++
++    case MFF_ENCAP_ETH_DST:
++        flow->encap_eth_dst = value->mac;
++        break;
++
++    case MFF_ENCAP_ETH_TYPE:
++        flow->encap_eth_type = value->be16;
++        break;
++
+     case MFF_ETH_SRC:
+         flow->dl_src = value->mac;
+         break;
+@@ -1734,6 +1898,52 @@ mf_set_wild(const struct mf_field *mf, struct match *match, char **err_str)
+         match->wc.masks.arp_sha = eth_addr_zero;
+         break;
+ 
++    case MFF_NSP:
++        match_set_nsp_masked(match, htonl(0), htonl(0));
++        break;
++
++    case MFF_NSI:
++        match_set_nsi_masked(match, 0, 0);
++        break;
++
++    case MFF_NSH_MDTYPE:
++        match_set_nsh_mdtype_masked(match, 0, 0);
++        break;
++
++    case MFF_NSH_NP:
++        match_set_nsh_np_masked(match, 0, 0);
++        break;
++
++    case MFF_NSH_C1:
++        match_set_nshc1_masked(match, htonl(0), htonl(0));
++        break;
++
++    case MFF_NSH_C2:
++        match_set_nshc2_masked(match, htonl(0), htonl(0));
++        break;
++
++    case MFF_NSH_C3:
++        match_set_nshc3_masked(match, htonl(0), htonl(0));
++        break;
++
++    case MFF_NSH_C4:
++        match_set_nshc4_masked(match, htonl(0), htonl(0));
++        break;
++
++    case MFF_ENCAP_ETH_SRC:
++        match->flow.encap_eth_src= eth_addr_zero;
++        match->wc.masks.encap_eth_src = eth_addr_zero;
++        break;
++
++    case MFF_ENCAP_ETH_DST:
++        match->flow.encap_eth_dst= eth_addr_zero;
++        match->wc.masks.encap_eth_dst = eth_addr_zero;
++        break;
++
++    case MFF_ENCAP_ETH_TYPE:
++        match_set_encap_eth_type_masked(match, htons(0), htons(0));
++        break;
++
+     case MFF_ARP_THA:
+     case MFF_ND_TLL:
+         match->flow.arp_tha = eth_addr_zero;
+@@ -1929,6 +2139,50 @@ mf_set(const struct mf_field *mf,
+         match_set_arp_sha_masked(match, value->mac, mask->mac);
+         break;
+ 
++    case MFF_NSP:
++        match_set_nsp_masked(match, value->be32, mask->be32);
++        break;
++
++    case MFF_NSI:
++        match_set_nsi_masked(match, value->u8, mask->u8);
++        break;
++
++    case MFF_NSH_MDTYPE:
++        match_set_nsh_mdtype_masked(match, value->u8, mask->u8);
++        break;
++
++    case MFF_NSH_NP:
++        match_set_nsh_np_masked(match, value->u8, mask->u8);
++        break;
++
++    case MFF_NSH_C1:
++        match_set_nshc1_masked(match, value->be32, mask->be32);
++        break;
++
++    case MFF_NSH_C2:
++        match_set_nshc2_masked(match, value->be32, mask->be32);
++        break;
++
++    case MFF_NSH_C3:
++        match_set_nshc3_masked(match, value->be32, mask->be32);
++        break;
++
++    case MFF_NSH_C4:
++        match_set_nshc4_masked(match, value->be32, mask->be32);
++        break;
++
++    case MFF_ENCAP_ETH_SRC:
++        match_set_encap_eth_src_masked(match, value->mac, mask->mac);
++        break;
++
++    case MFF_ENCAP_ETH_DST:
++        match_set_encap_eth_dst_masked(match, value->mac, mask->mac);
++        break;
++
++    case MFF_ENCAP_ETH_TYPE:
++        match_set_encap_eth_type_masked(match, value->be16, mask->be16);
++        break;
++
+     case MFF_ARP_THA:
+     case MFF_ND_TLL:
+         match_set_arp_tha_masked(match, value->mac, mask->mac);
+diff --git a/lib/meta-flow.h b/lib/meta-flow.h
+index 4bd9ff6..a226b79 100644
+--- a/lib/meta-flow.h
++++ b/lib/meta-flow.h
+@@ -1747,6 +1747,180 @@ enum OVS_PACKED_ENUM mf_field_id {
+      */
+     MFF_ND_TLL,
+ 
++    /* "nsp".
++     *
++     * For a packet received including a (32-bit)
++     * network service header service path (nsp), the nsp is stored
++     * in the low 24-bits and the high bits are zeroed.  For
++     * other packets, the value is 0.
++     *
++     * Type: be32.
++     * Maskable: bitwise.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSP(113) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nsp.
++     */
++    MFF_NSP,
++
++    /* "nsi".
++     *
++     * For a packet received, it includes a (8-bit)
++     * network service header service index (nsi).
++     *
++     * Type: u8.
++     * Maskable: bitwise.
++     * Formatting: decimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSI(114) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nsi.
++     */
++    MFF_NSI,
++
++    /* "nshc1".
++     *
++     * For a packet received including a (32-bit)
++     * Network Platform Context (nshc1), the nshc1 is stored
++     * in the 32-bits.  For other packets, the value is 0.
++     *
++     * Type: be32.
++     * Maskable: bitwise.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSH_C1(115) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nshc1.
++     */
++    MFF_NSH_C1,
++
++    /* "nshc2".
++     *
++     * For a packet received including a (32-bit)
++     * Network Shared Context (nshc2), the nshc2 is stored
++     * in the 32-bits.  For other packets, the value is 0.
++     *
++     * Type: be32.
++     * Maskable: bitwise.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSH_C2(116) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nshc2.
++     */
++    MFF_NSH_C2,
++
++    /* "nshc3".
++     *
++     * For a packet received via including a (32-bit)
++     * Service Platform Context (nshc3), the nshc3 is stored
++     * in the 32-bits.  For other packets, the value is 0.
++     *
++     * Type: be32.
++     * Maskable: bitwise.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSH_C3(117) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nshc3.
++     */
++    MFF_NSH_C3,
++
++    /* "nshc4".
++     *
++     * For a packet received including a (32-bit)
++     * Service Shared Context (nshc4), the nshc4 is stored
++     * in the 32-bits.  For other packets, the value is 0.
++     *
++     * Type: be32.
++     * Maskable: bitwise.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSH_C4(118) since v1.1.
++     * OXM: none.
++     * Prefix lookup member: nshc4.
++     */
++    MFF_NSH_C4,
++
++    /* "nsh_mdtype".
++     *
++     * For a packet received, it includes a (8-bit)
++     * nsh md-type field (md-type).
++     *
++     * Type: u8.
++     * Maskable: bitwise.
++     * Formatting: decimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_NSH_MDTYPE(119) since v1.1.
++     * OXM: none.
++     */
++    MFF_NSH_MDTYPE,
++
++     /* "nsh_np".
++      *
++      * For a packet received, it includes a (8-bit)
++      * nsh next protocol field (np).
++      *
++      * Type: u8.
++      * Maskable: bitwise.
++      * Formatting: decimal.
++      * Prerequisites: none.
++      * Access: read/write.
++      * NXM: NXM_NX_NSH_NP(120) since v1.1.
++      * OXM: none.
++      */
++     MFF_NSH_NP,
++
++	 /* "encap_eth_src".
++     *
++     * encap eth source address for Ethernet+NSH
++     *
++     * Type: MAC.
++     * Maskable: bitwise.
++     * Formatting: Ethernet.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_ENCAP_ETH_SRC(121) since v1.1.
++     * OXM: none.
++     */
++    MFF_ENCAP_ETH_SRC,
++
++    /* "encap_eth_dst".
++     *
++     * encap eth destination address for Ethernet+NSH
++     *
++     * Type: MAC.
++     * Maskable: bitwise.
++     * Formatting: Ethernet.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_ENCAP_ETH_DST(122) since v1.1.
++     * OXM: none.
++     */
++    MFF_ENCAP_ETH_DST,
++
++    /* "encap_eth_type".
++     *
++     * Encap Ethernet type.
++     *
++     * Type: be16.
++     * Maskable: no.
++     * Formatting: hexadecimal.
++     * Prerequisites: none.
++     * Access: read/write.
++     * NXM: NXM_NX_ENCAP_ETH_TYPE(123) since v1.1.
++     * OXM: none.
++     */
++    MFF_ENCAP_ETH_TYPE,
++
+     MFF_N_IDS
+ };
+ 
+diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
+index 92ceec1..406a492 100644
+--- a/lib/netdev-vport.c
++++ b/lib/netdev-vport.c
+@@ -582,9 +582,15 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
+             ext = strtok_r(str, ",", &save_ptr);
+             while (ext) {
+                 if (!strcmp(type, "vxlan") && !strcmp(ext, "gbp")) {
+-                    tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GBP);
++                    if (tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GPE))
++                        VLOG_WARN("VXLAN_GPE extension exists, VxLAN_GBP extension can't be added.");
++		    else
++                        tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GBP);
+                 } else if (!strcmp(type, "vxlan") && !strcmp(ext, "gpe")) {
+-                    tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GPE);
++                    if (tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GBP))
++                        VLOG_WARN("VXLAN_GBP extension exists, VxLAN_GPE extension can't be added.");
++		    else
++                        tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GPE);
+                 } else {
+                     VLOG_WARN("%s: unknown extension '%s'", name, ext);
+                 }
+diff --git a/lib/nx-match.c b/lib/nx-match.c
+index 0eecac7..8d2bc4b 100644
+--- a/lib/nx-match.c
++++ b/lib/nx-match.c
+@@ -949,6 +949,25 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
+                    ofputil_port_to_ofp11(flow->actset_output));
+     }
+ 
++    /* NSH */
++    nxm_put_32m(b, MFF_NSP, oxm, flow->nsp, match->wc.masks.nsp);
++    nxm_put_8m(b, MFF_NSI, oxm, flow->nsi, match->wc.masks.nsi);
++    nxm_put_8m(b, MFF_NSH_MDTYPE, oxm, flow->nsh_mdtype, match->wc.masks.nsh_mdtype);
++    nxm_put_8m(b, MFF_NSH_NP, oxm, flow->nsh_np, match->wc.masks.nsh_np);
++    nxm_put_32m(b, MFF_NSH_C1, oxm, flow->nshc1, match->wc.masks.nshc1);
++    nxm_put_32m(b, MFF_NSH_C2, oxm, flow->nshc2, match->wc.masks.nshc2);
++    nxm_put_32m(b, MFF_NSH_C3, oxm, flow->nshc3, match->wc.masks.nshc3);
++    nxm_put_32m(b, MFF_NSH_C4, oxm, flow->nshc4, match->wc.masks.nshc4);
++
++    /* ENCAP Eth */
++    nxm_put_eth_masked(b, MFF_ENCAP_ETH_SRC, oxm,
++                       flow->encap_eth_src, match->wc.masks.encap_eth_src);
++    nxm_put_eth_masked(b, MFF_ENCAP_ETH_DST, oxm,
++                       flow->encap_eth_dst, match->wc.masks.encap_eth_dst);
++    nxm_put_16m(b, MFF_ENCAP_ETH_TYPE, oxm,
++                ofputil_dl_type_to_openflow(flow->encap_eth_type),
++                match->wc.masks.encap_eth_type); //uncertain
++
+     /* Ethernet. */
+     nxm_put_eth_masked(b, MFF_ETH_SRC, oxm,
+                        flow->dl_src, match->wc.masks.dl_src);
+diff --git a/lib/odp-execute.c b/lib/odp-execute.c
+index b5204b2..b6dcd98 100644
+--- a/lib/odp-execute.c
++++ b/lib/odp-execute.c
+@@ -434,6 +434,8 @@ odp_execute_masked_set_action(struct dp_packet *packet,
+     case OVS_KEY_ATTR_ETHERTYPE:
+     case OVS_KEY_ATTR_IN_PORT:
+     case OVS_KEY_ATTR_VLAN:
++    case OVS_KEY_ATTR_NSH:
++    case OVS_KEY_ATTR_ENCAP_ETH:
+     case OVS_KEY_ATTR_ICMP:
+     case OVS_KEY_ATTR_ICMPV6:
+     case OVS_KEY_ATTR_TCP_FLAGS:
+@@ -497,6 +499,10 @@ requires_datapath_assistance(const struct nlattr *a)
+ 
+     case OVS_ACTION_ATTR_SET:
+     case OVS_ACTION_ATTR_SET_MASKED:
++    case OVS_ACTION_ATTR_PUSH_NSH:
++    case OVS_ACTION_ATTR_POP_NSH:
++    case OVS_ACTION_ATTR_PUSH_ETH:
++    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_SAMPLE:
+@@ -623,6 +629,10 @@ odp_execute_actions(void *dp, struct dp_packet **packets, int cnt, bool steal,
+             }
+             break;
+ 
++        case OVS_ACTION_ATTR_PUSH_NSH:
++        case OVS_ACTION_ATTR_POP_NSH:
++        case OVS_ACTION_ATTR_PUSH_ETH:
++        case OVS_ACTION_ATTR_POP_ETH:
+         case OVS_ACTION_ATTR_OUTPUT:
+         case OVS_ACTION_ATTR_TUNNEL_PUSH:
+         case OVS_ACTION_ATTR_TUNNEL_POP:
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 7983720..102dfd7 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -70,7 +70,8 @@ static void format_odp_key_attr(const struct nlattr *a,
+                                 const struct nlattr *ma,
+                                 const struct hmap *portno_names, struct ds *ds,
+                                 bool verbose);
+-
++static void format_eth(struct ds *ds, const char *name, const struct eth_addr key,
++                       const struct eth_addr *mask, bool verbose);
+ struct geneve_scan {
+     struct geneve_opt d[63];
+     int len;
+@@ -112,6 +113,10 @@ odp_action_len(uint16_t type)
+     case OVS_ACTION_ATTR_USERSPACE: return ATTR_LEN_VARIABLE;
+     case OVS_ACTION_ATTR_PUSH_VLAN: return sizeof(struct ovs_action_push_vlan);
+     case OVS_ACTION_ATTR_POP_VLAN: return 0;
++    case OVS_ACTION_ATTR_PUSH_NSH: return sizeof(struct ovs_action_push_nsh);
++    case OVS_ACTION_ATTR_POP_NSH: return 0;
++    case OVS_ACTION_ATTR_PUSH_ETH: return sizeof(struct ovs_action_push_eth);
++    case OVS_ACTION_ATTR_POP_ETH: return 0;
+     case OVS_ACTION_ATTR_PUSH_MPLS: return sizeof(struct ovs_action_push_mpls);
+     case OVS_ACTION_ATTR_POP_MPLS: return sizeof(ovs_be16);
+     case OVS_ACTION_ATTR_RECIRC: return sizeof(uint32_t);
+@@ -147,6 +152,8 @@ ovs_key_attr_to_string(enum ovs_key_attr attr, char *namebuf, size_t bufsize)
+     case OVS_KEY_ATTR_CT_LABELS: return "ct_label";
+     case OVS_KEY_ATTR_TUNNEL: return "tunnel";
+     case OVS_KEY_ATTR_IN_PORT: return "in_port";
++    case OVS_KEY_ATTR_ENCAP_ETH: return "encap_eth";
++    case OVS_KEY_ATTR_NSH: return "nsh";
+     case OVS_KEY_ATTR_ETHERNET: return "eth";
+     case OVS_KEY_ATTR_VLAN: return "vlan";
+     case OVS_KEY_ATTR_ETHERTYPE: return "eth_type";
+@@ -373,6 +380,36 @@ format_vlan_tci(struct ds *ds, ovs_be16 tci, ovs_be16 mask, bool verbose)
+ }
+ 
+ static void
++format_nsh(struct ds *ds, const struct ovs_action_push_nsh * nsh)
++{
++    const struct nsh_hdr *nsh_hdr =(struct nsh_hdr *)nsh->header;
++    ds_put_format(ds, "nsh_mdtype=%"PRIu8",nsh_np=%"PRIu8",nsp=%"PRIu32
++		  ",nsi=%"PRIu8",nshc1=%"PRIu32",nshc2=%"PRIu32
++		  ",nshc3=%"PRIu32",nshc4=%"PRIu32")",
++                  nsh_hdr->base.mdtype,
++                  nsh_hdr->base.proto,
++                  ntohl(nsh_hdr->base.path_hdr << 8),
++                  ntohl(nsh_hdr->base.path_hdr >> 24),
++                  ntohl(nsh_hdr->ctx.nshc1),
++                  ntohl(nsh_hdr->ctx.nshc2),
++                  ntohl(nsh_hdr->ctx.nshc3),
++                  ntohl(nsh_hdr->ctx.nshc4));
++}
++
++static void
++format_encap_eth(struct ds *ds, const struct ovs_action_push_eth *encap_eth)
++{
++    const struct encap_eth_hdr *encap_eth_hdr = (struct encap_eth_hdr *)encap_eth->header;
++    ds_put_format(ds, "encap_eth_type=%"PRIu16",",
++                  ntohs(encap_eth_hdr->encap_eth_type));
++    format_eth(ds, "encap_eth_src", encap_eth_hdr->encap_eth_src,
++               NULL, true);
++    format_eth(ds, "encap_eth_dst", encap_eth_hdr->encap_eth_dst,
++               NULL, true);
++    ds_put_format(ds, ")");
++}
++
++static void
+ format_mpls_lse(struct ds *ds, ovs_be32 mpls_lse)
+ {
+     ds_put_format(ds, "label=%"PRIu32",tc=%d,ttl=%d,bos=%d",
+@@ -500,7 +537,7 @@ format_odp_tnl_push_header(struct ds *ds, struct ovs_action_push_tnl *data)
+                       gnh->oam ? "oam," : "",
+                       gnh->critical ? "crit," : "",
+                       ntohl(get_16aligned_be32(&gnh->vni)) >> 8);
+- 
++
+         if (gnh->opt_len) {
+             ds_put_cstr(ds, ",options(");
+             format_geneve_opts(gnh->options, NULL, gnh->opt_len * 4,
+@@ -760,6 +797,8 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
+ {
+     int expected_len;
+     enum ovs_action_attr type = nl_attr_type(a);
++    const struct ovs_action_push_nsh *nsh;
++    const struct ovs_action_push_eth *encap_eth;
+     size_t size;
+ 
+     expected_len = odp_action_len(nl_attr_type(a));
+@@ -830,6 +869,23 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
+     case OVS_ACTION_ATTR_POP_VLAN:
+         ds_put_cstr(ds, "pop_vlan");
+         break;
++    case OVS_ACTION_ATTR_PUSH_NSH:
++        nsh = nl_attr_get(a);
++        ds_put_cstr(ds, "push_nsh(");
++        format_nsh(ds, nsh);
++        break;
++    case OVS_ACTION_ATTR_POP_NSH:
++        ds_put_cstr(ds, "pop_nsh");
++        break;
++
++    case OVS_ACTION_ATTR_PUSH_ETH:
++        encap_eth = nl_attr_get(a);
++        ds_put_cstr(ds, "push_eth(");
++        format_encap_eth(ds, encap_eth);
++        break;
++    case OVS_ACTION_ATTR_POP_ETH:
++        ds_put_cstr(ds, "pop_eth");
++        break;
+     case OVS_ACTION_ATTR_PUSH_MPLS: {
+         const struct ovs_action_push_mpls *mpls = nl_attr_get(a);
+         ds_put_cstr(ds, "push_mpls(");
+@@ -1618,6 +1674,72 @@ parse_odp_action(const char *s, const struct simap *port_names,
+     }
+ 
+     {
++        struct ovs_action_push_nsh push;
++        struct nsh_hdr *nsh = (struct nsh_hdr *)push.header;
++        ovs_be32 nsp, nshc1,nshc2,nshc3,nshc4;
++        uint8_t nsi, nsh_mdtype, nsh_np;
++        int n = -1;
++
++        if (ovs_scan_len(s, &n, "push_nsh(nsh_mdtype=%"SCNi8",nsh_np=%"SCNi8",nsp=0x%"SCNx32
++                        ",nsi=%"SCNi8",nshc1=0x%"SCNx32",nshc2=0x%"SCNx32
++                        ",nshc3=0x%"SCNx32",nshc4=0x%"SCNx32"))",
++                        &nsh_mdtype, &nsh_np,
++                        &nsp, &nsi,
++                        &nshc1, &nshc2,
++                        &nshc3, &nshc4)) {
++            if (nsh_mdtype == NSH_M_TYPE1) {
++                nsh->base.mdtype = NSH_M_TYPE1;
++                nsh->base.version = 0x01;
++                nsh->base.length = 6;
++                nsh->base.proto = nsh_np;
++                nsh->base.path_hdr= nsp;
++                nsh->base.svc_idx = nsi;
++                nsh->ctx.nshc1=nshc1;
++                nsh->ctx.nshc2=nshc2;
++                nsh->ctx.nshc3=nshc3;
++                nsh->ctx.nshc4=nshc4;
++                push.nsh_mdtype = NSH_M_TYPE1;
++                nl_msg_put_unspec(actions, OVS_ACTION_ATTR_PUSH_NSH,
++                              &push, sizeof push);
++            }
++
++            return n;
++        }
++    }
++
++    if (!strncmp(s, "pop_nsh", 7)) {
++        nl_msg_put_flag(actions, OVS_ACTION_ATTR_POP_NSH);
++        return 7;
++    }
++
++    {
++        struct ovs_action_push_eth push;
++        struct encap_eth_hdr *encap_eth = (struct encap_eth_hdr *)push.header;
++        uint16_t encap_eth_type;
++        int n = -1;
++
++        if (ovs_scan_len(s, &n, "push_eth(encap_eth_type=0x%"SCNx16",encap_eth_dst="ETH_ADDR_SCAN_FMT",encap_eth_src="ETH_ADDR_SCAN_FMT")",
++                         &encap_eth_type,
++                         ETH_ADDR_SCAN_ARGS(encap_eth->encap_eth_dst),
++                         ETH_ADDR_SCAN_ARGS(encap_eth->encap_eth_src))) {
++            if (encap_eth->encap_eth_type == ETH_P_NSH) {
++                push.encap_eth_type = ETH_P_NSH;
++                encap_eth->encap_eth_type = htons(ETH_P_NSH);
++                nl_msg_put_unspec(actions, OVS_ACTION_ATTR_PUSH_ETH,
++                              &push, sizeof push);
++            }
++
++            return n;
++        }
++
++    }
++
++    if (!strncmp(s, "pop_eth", 7)) {
++        nl_msg_put_flag(actions, OVS_ACTION_ATTR_POP_ETH);
++        return 7;
++    }
++
++    {
+         double percentage;
+         int n = -1;
+ 
+@@ -1759,6 +1881,8 @@ static const struct attr_len_tbl ovs_flow_key_attr_lens[OVS_KEY_ATTR_MAX + 1] =
+                                  .next = ovs_tun_key_attr_lens,
+                                  .next_max = OVS_TUNNEL_KEY_ATTR_MAX },
+     [OVS_KEY_ATTR_IN_PORT]   = { .len = 4  },
++    [OVS_KEY_ATTR_ENCAP_ETH] = { .len = 14  },
++    [OVS_KEY_ATTR_NSH]       = { .len = 24  },
+     [OVS_KEY_ATTR_ETHERNET]  = { .len = sizeof(struct ovs_key_ethernet) },
+     [OVS_KEY_ATTR_VLAN]      = { .len = 2 },
+     [OVS_KEY_ATTR_ETHERTYPE] = { .len = 2 },
+@@ -2146,6 +2270,23 @@ format_be64(struct ds *ds, const char *name, ovs_be64 key,
+ }
+ 
+ static void
++format_be32(struct ds *ds, const char *name, ovs_be32 key,
++            const ovs_be32 *mask, bool verbose)
++{
++    bool mask_empty = mask && !*mask;
++
++    if (verbose || !mask_empty) {
++        bool mask_full = !mask || *mask == OVS_BE32_MAX;
++
++        ds_put_format(ds, "%s=%"PRIx32, name, ntohl(key));
++        if (!mask_full) { /* Partially masked. */
++            ds_put_format(ds, "/%#"PRIx32, ntohl(*mask));
++        }
++        ds_put_char(ds, ',');
++    }
++}
++
++static void
+ format_ipv4(struct ds *ds, const char *name, ovs_be32 key,
+             const ovs_be32 *mask, bool verbose)
+ {
+@@ -2798,6 +2939,34 @@ format_odp_key_attr(const struct nlattr *a, const struct nlattr *ma,
+         }
+         break;
+ 
++    case OVS_KEY_ATTR_NSH: {
++        const struct ovs_key_nsh *mask = ma ? nl_attr_get(ma) : NULL;
++        const struct ovs_key_nsh *key = nl_attr_get(a);
++
++        format_u8u(ds, "nsi", key->nsi, MASK(mask, nsi), verbose);
++        format_be32(ds, "nsp", key->nsp, MASK(mask, nsp), verbose);
++        format_u8u(ds, "nsh_mdtype", key->nsh_mdtype, MASK(mask, nsh_mdtype), verbose);
++        format_u8u(ds, "nsh_np", key->nsh_np, MASK(mask, nsh_np), verbose);
++        format_be32(ds, "nshc1", key->nshc1, MASK(mask, nshc1), verbose);
++        format_be32(ds, "nshc2", key->nshc2, MASK(mask, nshc2), verbose);
++        format_be32(ds, "nshc3", key->nshc3, MASK(mask, nshc3), verbose);
++        format_be32(ds, "nshc4", key->nshc4, MASK(mask, nshc4), verbose);
++        ds_chomp(ds, ',');
++        break;
++    }
++
++    case OVS_KEY_ATTR_ENCAP_ETH: {
++        const struct ovs_key_encap_eth *mask = ma ? nl_attr_get(ma) : NULL;
++        const struct ovs_key_encap_eth *key = nl_attr_get(a);
++
++        format_be16(ds, "encap_eth_type", key->encap_eth_type, MASK(mask, encap_eth_type), verbose);
++        format_eth(ds, "encap_eth_src", key->encap_eth_src, MASK(mask, encap_eth_src), verbose);
++        format_eth(ds, "encap_eth_dst", key->encap_eth_dst, MASK(mask, encap_eth_dst), verbose);
++        ds_chomp(ds, ',');
++
++        break;
++    }
++
+     case OVS_KEY_ATTR_ETHERNET: {
+         const struct ovs_key_ethernet *mask = ma ? nl_attr_get(ma) : NULL;
+         const struct ovs_key_ethernet *key = nl_attr_get(a);
+@@ -3184,6 +3353,48 @@ scan_eth(const char *s, struct eth_addr *key, struct eth_addr *mask)
+ }
+ 
+ static int
++scan_nsp(const char *s, uint32_t *key, uint32_t *mask)
++{
++    int n;
++
++    if (ovs_scan(s, "%"SCNi32"%n", key, &n)) {
++        int len = n;
++        *key = htonl(*key);
++        if (mask) {
++            if (ovs_scan(s + len, "/%"SCNi32"%n", mask, &n)) {
++                len += n;
++                *mask =htonl(*mask);
++            } else {
++                *mask = UINT32_MAX;
++            }
++        }
++        return len;
++    }
++    return 0;
++}
++
++static int
++scan_encap_eth_type(const char *s, uint16_t *key, uint16_t *mask)
++{
++    int n;
++
++    if (ovs_scan(s, "%"SCNi16"%n", key, &n)) {
++        int len = n;
++        *key = htons(*key);
++        if (mask) {
++            if (ovs_scan(s + len, "/%"SCNi16"%n", mask, &n)) {
++                len += n;
++                *mask = htons(*mask);
++            } else {
++                *mask = UINT16_MAX;
++            }
++        }
++        return len;
++    }
++    return 0;
++}
++
++static int
+ scan_ipv4(const char *s, ovs_be32 *key, ovs_be32 *mask)
+ {
+     int n;
+@@ -4123,6 +4334,23 @@ parse_odp_key_mask_attr(const char *s, const struct simap *port_names,
+         SCAN_FIELD_NESTED_FUNC("flags(", uint16_t, tun_flags, tun_flags_to_attr);
+     } SCAN_END_NESTED();
+ 
++    SCAN_BEGIN("nsh(", struct ovs_key_nsh) {
++        SCAN_FIELD("nsh_mdtype=", u8, nsh_mdtype);
++        SCAN_FIELD("nsh_np=", u8, nsh_np);
++        SCAN_FIELD("nsp=", nsp, nsp);
++        SCAN_FIELD("nsi=", u8, nsi);
++        SCAN_FIELD("nshc1=", u32, nshc1);
++        SCAN_FIELD("nshc2=", u32, nshc2);
++        SCAN_FIELD("nshc3=", u32, nshc3);
++        SCAN_FIELD("nshc4=", u32, nshc4);
++    } SCAN_END(OVS_KEY_ATTR_NSH);
++
++    SCAN_BEGIN("encap_eth(", struct ovs_key_encap_eth) {
++        SCAN_FIELD("encap_eth_src=", eth, encap_eth_src);
++        SCAN_FIELD("encap_eth_dst=", eth, encap_eth_dst);
++        SCAN_FIELD("encap_eth_type=", encap_eth_type, encap_eth_type);
++    } SCAN_END(OVS_KEY_ATTR_ENCAP_ETH);
++
+     SCAN_SINGLE_PORT("in_port(", uint32_t, OVS_KEY_ATTR_IN_PORT);
+ 
+     SCAN_BEGIN("eth(", struct ovs_key_ethernet) {
+@@ -4325,11 +4553,35 @@ union ovs_key_tp {
+ static void get_tp_key(const struct flow *, union ovs_key_tp *);
+ static void put_tp_key(const union ovs_key_tp *, struct flow *);
+ 
++void
++get_nsh_key(const struct flow *flow, struct ovs_key_nsh *nsh)
++{
++    nsh->nsi = flow->nsi;
++    nsh->nsp = flow->nsp;
++    nsh->nsh_mdtype = flow->nsh_mdtype;
++    nsh->nsh_np = flow->nsh_np;
++    nsh->reserved = 0;
++    nsh->nshc1 = flow->nshc1;
++    nsh->nshc2 = flow->nshc2;
++    nsh->nshc3 = flow->nshc3;
++    nsh->nshc4 = flow->nshc4;
++}
++
++void
++get_encap_eth_key(const struct flow *flow, struct ovs_key_encap_eth *encap_eth)
++{
++    encap_eth->encap_eth_type = flow->encap_eth_type;
++    encap_eth->encap_eth_src = flow->encap_eth_src;
++    encap_eth->encap_eth_dst = flow->encap_eth_dst;
++}
++
+ static void
+ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
+                          bool export_mask, struct ofpbuf *buf)
+ {
+     struct ovs_key_ethernet *eth_key;
++    struct ovs_key_nsh *nsh_key;
++    struct ovs_key_encap_eth *encap_eth_key;
+     size_t encap;
+     const struct flow *flow = parms->flow;
+     const struct flow *data = export_mask ? parms->mask : parms->flow;
+@@ -4368,6 +4620,18 @@ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
+         nl_msg_put_odp_port(buf, OVS_KEY_ATTR_IN_PORT, parms->odp_in_port);
+     }
+ 
++    if (flow->nsh_mdtype) {
++        nsh_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_NSH,
++                                           sizeof *nsh_key);
++        get_nsh_key(data, nsh_key);
++    }
++
++    if (flow->encap_eth_type) {
++        encap_eth_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_ENCAP_ETH,
++                                           sizeof *encap_eth_key);
++        get_encap_eth_key(data, encap_eth_key);
++    }
++
+     eth_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_ETHERNET,
+                                        sizeof *eth_key);
+     get_ethernet_key(data, eth_key);
+@@ -5225,6 +5489,28 @@ odp_flow_key_to_flow__(const struct nlattr *key, size_t key_len,
+         flow->in_port.odp_port = ODPP_NONE;
+     }
+ 
++    /* NSH header. */
++    if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_NSH)) {
++        const struct ovs_key_nsh *nsh_key;
++
++        nsh_key = nl_attr_get(attrs[OVS_KEY_ATTR_NSH]);
++        put_nsh_key(nsh_key, flow);
++        if (is_mask) {
++            expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_NSH;
++        }
++    }
++
++    /* ENCAP Eth header. */
++    if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_ENCAP_ETH)) {
++        const struct ovs_key_encap_eth *encap_eth_key;
++
++        encap_eth_key = nl_attr_get(attrs[OVS_KEY_ATTR_ENCAP_ETH]);
++        put_encap_eth_key(encap_eth_key, flow);
++        if (is_mask) {
++            expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_ENCAP_ETH;
++        }
++    }
++
+     /* Ethernet header. */
+     if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_ETHERNET)) {
+         const struct ovs_key_ethernet *eth_key;
+@@ -5526,6 +5812,41 @@ put_ethernet_key(const struct ovs_key_ethernet *eth, struct flow *flow)
+     flow->dl_dst = eth->eth_dst;
+ }
+ 
++void
++put_nsh_key(const struct ovs_key_nsh *nsh, struct flow *flow)
++{
++    flow->nsh_mdtype = nsh->nsh_mdtype;
++    flow->nsh_np = nsh->nsh_np;
++    flow->nsi = nsh->nsi;
++    flow->nsp = nsh->nsp;
++    flow->nshc1 = nsh->nshc1;
++    flow->nshc2 = nsh->nshc2;
++    flow->nshc3 = nsh->nshc3;
++    flow->nshc4 = nsh->nshc4;
++}
++
++void
++flow_zero_nsh(struct flow *flow)
++{
++    void *dst_p = &(flow->nshc1);
++    memset(dst_p, 0, 24);
++}
++
++void
++flow_zero_encap_eth(struct flow *flow)
++{
++    void *dst_p = &flow->encap_eth_src;
++    memset(dst_p, 0, 16);
++}
++
++void
++put_encap_eth_key(const struct ovs_key_encap_eth *encap_eth, struct flow *flow)
++{
++    flow->encap_eth_type = encap_eth->encap_eth_type;
++    flow->encap_eth_src = encap_eth->encap_eth_src;
++    flow->encap_eth_dst = encap_eth->encap_eth_dst;
++}
++
+ static void
+ commit_set_ether_addr_action(const struct flow *flow, struct flow *base_flow,
+                              struct ofpbuf *odp_actions,
+@@ -5577,6 +5898,94 @@ commit_vlan_action(ovs_be16 vlan_tci, struct flow *base,
+     base->vlan_tci = vlan_tci;
+ }
+ 
++static void
++commit_nsh_pop_action(const struct flow *flow, struct flow *base,
++                   struct ofpbuf *odp_actions, struct flow_wildcards *wc)
++{
++    struct ovs_key_nsh flow_key, base_key;
++    get_nsh_key(flow, &flow_key);
++    get_nsh_key(base, &base_key);
++
++    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
++        memset(&wc->masks.nsh_mdtype, 0xff, sizeof wc->masks.nsh_mdtype);
++
++        if (base->nsh_mdtype) {
++            nl_msg_put_flag(odp_actions, OVS_ACTION_ATTR_POP_NSH);
++        }
++    }
++}
++
++static void
++commit_nsh_push_action(const struct flow *flow, struct flow *base,
++                   struct ofpbuf *odp_actions)
++{
++    struct ovs_key_nsh flow_key, base_key;
++    get_nsh_key(flow, &flow_key);
++    get_nsh_key(base, &base_key);
++
++    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
++        if (flow->nsh_mdtype) {
++            struct ovs_action_push_nsh nsh;
++            nsh.nsh_mdtype = flow->nsh_mdtype;
++            struct nsh_hdr *nsh_hdr = (struct nsh_hdr *)nsh.header;
++            memset(nsh_hdr, 0, sizeof *nsh_hdr);
++            nsh_hdr->base.length = 6;
++            nsh_hdr->base.proto = flow->nsh_np;
++            nsh_hdr->base.mdtype = flow->nsh_mdtype;
++            nsh_hdr->base.proto = flow->nsh_np;
++            nsh_hdr->base.path_hdr = flow->nsp >> 8 | flow->nsi << 24;
++            nsh_hdr->ctx.nshc1 = flow->nshc1;
++            nsh_hdr->ctx.nshc2 = flow->nshc2;
++            nsh_hdr->ctx.nshc3 = flow->nshc3;
++            nsh_hdr->ctx.nshc4 = flow->nshc4;
++            nl_msg_put_unspec(odp_actions, OVS_ACTION_ATTR_PUSH_NSH,
++                              &nsh, sizeof nsh);
++        }
++    }
++}
++
++static void
++commit_encap_eth_pop_action(const struct flow *flow, struct flow *base,
++                   struct ofpbuf *odp_actions, struct flow_wildcards *wc)
++{
++    struct ovs_key_encap_eth flow_key, base_key;
++    get_encap_eth_key(flow, &flow_key);
++    get_encap_eth_key(base, &base_key);
++
++    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
++        memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
++
++        if (base->encap_eth_type) {
++            nl_msg_put_flag(odp_actions, OVS_ACTION_ATTR_POP_ETH);
++        }
++    }
++}
++
++static void
++commit_encap_eth_push_action(const struct flow *flow, struct flow *base,
++                   struct ofpbuf *odp_actions)
++{
++    struct ovs_key_encap_eth flow_key, base_key;
++    get_encap_eth_key(flow, &flow_key);
++    get_encap_eth_key(base, &base_key);
++
++    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
++        if (flow->encap_eth_type) {
++            struct ovs_action_push_eth encap_eth;
++            encap_eth.encap_eth_type = flow->encap_eth_type;
++            struct encap_eth_hdr *encap_eth_header =
++                       (struct encap_eth_hdr *)encap_eth.header;
++            void *dst_p = encap_eth_header->encap_eth_dst.ea;
++            void *src_p = encap_eth_header->encap_eth_src.ea;
++            memcpy(dst_p, flow->encap_eth_dst.ea, sizeof flow->encap_eth_dst);
++            memcpy(src_p, flow->encap_eth_src.ea, sizeof flow->encap_eth_src);
++            encap_eth_header->encap_eth_type = htons(ETH_P_NSH);
++            nl_msg_put_unspec(odp_actions, OVS_ACTION_ATTR_PUSH_ETH,
++                              &encap_eth, sizeof encap_eth);
++        }
++    }
++}
++
+ /* Wildcarding already done at action translation time. */
+ static void
+ commit_mpls_action(const struct flow *flow, struct flow *base,
+@@ -6008,6 +6417,10 @@ commit_odp_actions(const struct flow *flow, struct flow *base,
+     slow2 = commit_set_icmp_action(flow, base, odp_actions, wc);
+     commit_mpls_action(flow, base, odp_actions);
+     commit_vlan_action(flow->vlan_tci, base, odp_actions, wc);
++    commit_encap_eth_pop_action(flow, base, odp_actions, wc);
++    commit_nsh_pop_action(flow, base, odp_actions, wc);
++    commit_nsh_push_action(flow, base, odp_actions);
++    commit_encap_eth_push_action(flow, base, odp_actions);
+     commit_set_priority_action(flow, base, odp_actions, wc, use_masked);
+     commit_set_pkt_mark_action(flow, base, odp_actions, wc, use_masked);
+ 
+diff --git a/lib/odp-util.h b/lib/odp-util.h
+index 51cf5c3..2cb04f1 100644
+--- a/lib/odp-util.h
++++ b/lib/odp-util.h
+@@ -66,7 +66,7 @@ enum slow_path_reason {
+ /* Mask of all slow_path_reasons. */
+ enum {
+     SLOW_PATH_REASON_MASK = 0
+-#define SPR(ENUM, STRING, EXPLANATION) | 1 << ENUM##_INDEX 
++#define SPR(ENUM, STRING, EXPLANATION) | 1 << ENUM##_INDEX
+     SLOW_PATH_REASONS
+ #undef SPR
+ };
+@@ -126,6 +126,8 @@ void odp_portno_names_destroy(struct hmap *portno_names);
+  *  OVS_KEY_ATTR_CT_ZONE                 2     2     4      8
+  *  OVS_KEY_ATTR_CT_MARK                 4    --     4      8
+  *  OVS_KEY_ATTR_CT_LABEL               16    --     4     20
++ *  OVS_KEY_ATTR_NSH                    24    --     4     28
++ *  OVS_KEY_ATTR_ENCAP                  14    --     4     18
+  *  OVS_KEY_ATTR_ETHERNET               12    --     4     16
+  *  OVS_KEY_ATTR_ETHERTYPE               2     2     4      8  (outer VLAN ethertype)
+  *  OVS_KEY_ATTR_VLAN                    2     2     4      8
+@@ -150,6 +152,12 @@ struct odputil_keybuf {
+     uint32_t keybuf[DIV_ROUND_UP(ODPUTIL_FLOW_KEY_BYTES, 4)];
+ };
+ 
++void put_nsh_key(const struct ovs_key_nsh *, struct flow *);
++void get_nsh_key(const struct flow *flow, struct ovs_key_nsh *nsh);
++void put_encap_eth_key(const struct ovs_key_encap_eth *encap_eth, struct flow *flow);
++void get_encap_eth_key(const struct flow *flow, struct ovs_key_encap_eth *encap_eth);
++void flow_zero_nsh(struct flow *);
++void flow_zero_encap_eth(struct flow *);
+ enum odp_key_fitness odp_tun_key_from_attr(const struct nlattr *, bool udpif,
+                                            struct flow_tnl *);
+ 
+diff --git a/lib/ofp-actions.c b/lib/ofp-actions.c
+index aac4ff0..f4062b2 100644
+--- a/lib/ofp-actions.c
++++ b/lib/ofp-actions.c
+@@ -299,6 +299,18 @@ enum ofp_raw_action_type {
+     /* NX1.0+(36): struct nx_action_nat, ... */
+     NXAST_RAW_NAT,
+ 
++    /* NX1.0+(38): void. */
++    NXAST_RAW_PUSH_NSH,
++
++    /* NX1.0+(39): void. */
++    NXAST_RAW_POP_NSH,
++
++    /* NX1.0+(40): void. */
++    NXAST_RAW_PUSH_ETH,
++
++    /* NX1.0+(41): void. */
++    NXAST_RAW_POP_ETH,
++
+ /* ## ------------------ ## */
+ /* ## Debugging actions. ## */
+ /* ## ------------------ ## */
+@@ -1624,7 +1636,127 @@ format_PUSH_VLAN(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
+     ds_put_format(s, "%spush_vlan:%s%#"PRIx16,
+                   colors.param, colors.end, ETH_TYPE_VLAN_8021Q);
+ }
+-
++
++/* Push NSH header actions. */
++static enum ofperr
++decode_NXAST_RAW_PUSH_NSH(struct ofpbuf * out)
++{
++    ofpact_put_PUSH_NSH(out)->ofpact.raw = NXAST_RAW_PUSH_NSH;
++
++    return 0;
++}
++
++static void
++encode_PUSH_NSH(const struct ofpact_null *null OVS_UNUSED,
++                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
++{
++    put_NXAST_PUSH_NSH(out);
++}
++
++static char * OVS_WARN_UNUSED_RESULT
++parse_PUSH_NSH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
++                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
++{
++    ofpact_put_PUSH_NSH(ofpacts)->ofpact.raw = NXAST_RAW_PUSH_NSH;;
++    return NULL;
++}
++
++static void
++format_PUSH_NSH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
++{
++    ds_put_format(s, "push_nsh");
++}
++
++/* Pop NSH header actions. */
++static enum ofperr
++decode_NXAST_RAW_POP_NSH(struct ofpbuf * out)
++{
++    ofpact_put_POP_NSH(out)->ofpact.raw = NXAST_RAW_POP_NSH;
++
++    return 0;
++}
++
++static void
++encode_POP_NSH(const struct ofpact_null *null OVS_UNUSED,
++                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
++{
++    put_NXAST_POP_NSH(out);
++}
++
++static char * OVS_WARN_UNUSED_RESULT
++parse_POP_NSH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
++                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
++{
++    ofpact_put_POP_NSH(ofpacts)->ofpact.raw = NXAST_RAW_POP_NSH;
++    return NULL;
++}
++
++static void
++format_POP_NSH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
++{
++    ds_put_format(s, "pop_nsh");
++}
++
++/* Push ENCAP Eth header actions. */
++static enum ofperr
++decode_NXAST_RAW_PUSH_ETH(struct ofpbuf * out)
++{
++    ofpact_put_PUSH_ETH(out)->ofpact.raw = NXAST_RAW_PUSH_ETH;
++
++    return 0;
++}
++
++static void
++encode_PUSH_ETH(const struct ofpact_null *null OVS_UNUSED,
++                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
++{
++    put_NXAST_PUSH_ETH(out);
++}
++
++static char * OVS_WARN_UNUSED_RESULT
++parse_PUSH_ETH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
++                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
++{
++    ofpact_put_PUSH_ETH(ofpacts)->ofpact.raw = NXAST_RAW_PUSH_ETH;;
++    return NULL;
++}
++
++static void
++format_PUSH_ETH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
++{
++    ds_put_format(s, "push_eth");
++}
++
++/* Pop ENCAP ETH header actions. */
++static enum ofperr
++decode_NXAST_RAW_POP_ETH(struct ofpbuf * out)
++{
++    ofpact_put_POP_ETH(out)->ofpact.raw = NXAST_RAW_POP_ETH;
++
++    return 0;
++}
++
++static void
++encode_POP_ETH(const struct ofpact_null *null OVS_UNUSED,
++                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
++{
++    put_NXAST_POP_ETH(out);
++}
++
++static char * OVS_WARN_UNUSED_RESULT
++parse_POP_ETH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
++                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
++{
++    ofpact_put_POP_ETH(ofpacts)->ofpact.raw = NXAST_RAW_POP_ETH;
++    return NULL;
++}
++
++static void
++format_POP_ETH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
++{
++    ds_put_format(s, "pop_eth");
++}
++
+ /* Action structure for OFPAT10_SET_DL_SRC/DST and OFPAT11_SET_DL_SRC/DST. */
+ struct ofp_action_dl_addr {
+     ovs_be16 type;                  /* Type. */
+@@ -5910,6 +6042,10 @@ ofpact_is_set_or_move_action(const struct ofpact *a)
+     case OFPACT_POP_QUEUE:
+     case OFPACT_PUSH_MPLS:
+     case OFPACT_PUSH_VLAN:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
++    case OFPACT_PUSH_ETH:
++    case OFPACT_POP_ETH:
+     case OFPACT_RESUBMIT:
+     case OFPACT_SAMPLE:
+     case OFPACT_STACK_POP:
+@@ -5937,6 +6073,10 @@ ofpact_is_allowed_in_actions_set(const struct ofpact *a)
+     case OFPACT_POP_MPLS:
+     case OFPACT_PUSH_MPLS:
+     case OFPACT_PUSH_VLAN:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
++    case OFPACT_PUSH_ETH:
++    case OFPACT_POP_ETH:
+     case OFPACT_REG_MOVE:
+     case OFPACT_SET_FIELD:
+     case OFPACT_SET_ETH_DST:
+@@ -6162,6 +6302,10 @@ ovs_instruction_type_from_ofpact_type(enum ofpact_type type)
+     case OFPACT_SET_VLAN_PCP:
+     case OFPACT_STRIP_VLAN:
+     case OFPACT_PUSH_VLAN:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
++    case OFPACT_PUSH_ETH:
++    case OFPACT_POP_ETH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+     case OFPACT_SET_IPV4_SRC:
+@@ -6709,6 +6853,10 @@ ofpact_check__(enum ofputil_protocol *usable_protocols, struct ofpact *a,
+     case OFPACT_SET_TUNNEL:
+     case OFPACT_SET_QUEUE:
+     case OFPACT_POP_QUEUE:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
++    case OFPACT_PUSH_ETH:
++    case OFPACT_POP_ETH:
+     case OFPACT_RESUBMIT:
+         return 0;
+ 
+@@ -7266,6 +7414,10 @@ ofpact_outputs_to_port(const struct ofpact *ofpact, ofp_port_t port)
+     case OFPACT_SET_VLAN_PCP:
+     case OFPACT_STRIP_VLAN:
+     case OFPACT_PUSH_VLAN:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
++    case OFPACT_PUSH_ETH:
++    case OFPACT_POP_ETH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+     case OFPACT_SET_IPV4_SRC:
+diff --git a/lib/ofp-actions.h b/lib/ofp-actions.h
+index 4bd8854..3897c0b 100644
+--- a/lib/ofp-actions.h
++++ b/lib/ofp-actions.h
+@@ -93,6 +93,12 @@
+     OFPACT(POP_QUEUE,       ofpact_null,        ofpact, "pop_queue")    \
+     OFPACT(FIN_TIMEOUT,     ofpact_fin_timeout, ofpact, "fin_timeout")  \
+                                                                         \
++    /* NSH */                                                           \
++    OFPACT(PUSH_NSH,        ofpact_null,        ofpact, "push_nsh")     \
++    OFPACT(POP_NSH,         ofpact_null,        ofpact, "pop_nsh")      \
++    OFPACT(PUSH_ETH,        ofpact_null,        ofpact, "push_eth")   	\
++    OFPACT(POP_ETH,         ofpact_null,        ofpact, "pop_eth")   	\
++																		\
+     /* Flow table interaction. */                                       \
+     OFPACT(RESUBMIT,        ofpact_resubmit,    ofpact, "resubmit")     \
+     OFPACT(LEARN,           ofpact_learn,       specs, "learn")         \
+diff --git a/ofproto/ofproto-dpif-sflow.c b/ofproto/ofproto-dpif-sflow.c
+index fbc82b7..e15e8d2 100644
+--- a/ofproto/ofproto-dpif-sflow.c
++++ b/ofproto/ofproto-dpif-sflow.c
+@@ -976,6 +976,8 @@ sflow_read_set_action(const struct nlattr *attr,
+     case OVS_KEY_ATTR_IN_PORT:
+     case OVS_KEY_ATTR_ETHERNET:
+     case OVS_KEY_ATTR_VLAN:
++    case OVS_KEY_ATTR_NSH:
++    case OVS_KEY_ATTR_ENCAP_ETH:
+         break;
+ 
+     case OVS_KEY_ATTR_MPLS: {
+diff --git a/ofproto/ofproto-dpif-upcall.c b/ofproto/ofproto-dpif-upcall.c
+index 2612b7d..f59eed8 100644
+--- a/ofproto/ofproto-dpif-upcall.c
++++ b/ofproto/ofproto-dpif-upcall.c
+@@ -39,6 +39,7 @@
+ #include "seq.h"
+ #include "unixctl.h"
+ #include "openvswitch/vlog.h"
++#include "odp-util.h"
+ 
+ #define MAX_QUEUE_LENGTH 512
+ #define UPCALL_MAX_BATCH 64
+@@ -746,6 +747,9 @@ recv_upcalls(struct handler *handler)
+         struct upcall *upcall = &upcalls[n_upcalls];
+         struct flow *flow = &flows[n_upcalls];
+         unsigned int mru;
++        struct ovs_key_nsh reserve_nsh;
++        struct ovs_key_encap_eth reserve_encap_eth;
++        bool nsh_mdtype_flag, encap_eth_type_flag;
+         int error;
+ 
+         ofpbuf_use_stub(recv_buf, recv_stubs[n_upcalls],
+@@ -796,8 +800,23 @@ recv_upcalls(struct handler *handler)
+         }
+ 
+         pkt_metadata_from_flow(&dupcall->packet.md, flow);
++
++        nsh_mdtype_flag = !!(flow->nsh_mdtype);
++        encap_eth_type_flag = !!(flow->encap_eth_type);
++        if(nsh_mdtype_flag)
++            get_nsh_key(flow, &reserve_nsh);
++
++        if(encap_eth_type_flag)
++            get_encap_eth_key(flow, &reserve_encap_eth);
++
+         flow_extract(&dupcall->packet, flow);
+ 
++        if(nsh_mdtype_flag)
++            put_nsh_key(&reserve_nsh, flow);
++
++        if(encap_eth_type_flag)
++            put_encap_eth_key(&reserve_encap_eth, flow);
++
+         error = process_upcall(udpif, upcall,
+                                &upcall->odp_actions, &upcall->wc);
+         if (error) {
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index a02dc24..4f91d0a 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -4240,6 +4240,10 @@ freeze_unroll_actions(const struct ofpact *a, const struct ofpact *end,
+         case OFPACT_SET_VLAN_PCP:
+         case OFPACT_STRIP_VLAN:
+         case OFPACT_PUSH_VLAN:
++        case OFPACT_PUSH_NSH:
++        case OFPACT_POP_NSH:
++        case OFPACT_PUSH_ETH:
++        case OFPACT_POP_ETH:
+         case OFPACT_SET_ETH_SRC:
+         case OFPACT_SET_ETH_DST:
+         case OFPACT_SET_IPV4_SRC:
+@@ -4524,6 +4528,24 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
+             }
+             break;
+ 
++        case OFPACT_PUSH_NSH:
++            memset(&wc->masks.nsh_mdtype, 0xff, sizeof wc->masks.nsh_mdtype);
++            break;
++
++        case OFPACT_POP_NSH:
++            memset(&wc->masks.nsh_mdtype, 0xff, sizeof wc->masks.nsh_mdtype);
++            flow_zero_nsh(flow);
++            break;
++
++        case OFPACT_PUSH_ETH:
++            memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
++            break;
++
++        case OFPACT_POP_ETH:
++            memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
++            flow_zero_encap_eth(flow);
++            break;
++
+         case OFPACT_STRIP_VLAN:
+             memset(&wc->masks.vlan_tci, 0xff, sizeof wc->masks.vlan_tci);
+             flow->vlan_tci = htons(0);
+diff --git a/tests/ofproto.at b/tests/ofproto.at
+index 6c7217d..7141e39 100644
+--- a/tests/ofproto.at
++++ b/tests/ofproto.at
+@@ -1777,7 +1777,7 @@ head_table () {
+         actions: output group set_field strip_vlan push_vlan mod_nw_ttl dec_ttl set_mpls_ttl dec_mpls_ttl push_mpls pop_mpls set_queue
+         supported on Set-Field: tun_id tun_src tun_dst tun_ipv6_src tun_ipv6_dst tun_flags tun_gbp_id tun_gbp_flags tun_gpe_np tun_gpe_flags tun_metadata0 dnl
+ tun_metadata1 tun_metadata2 tun_metadata3 tun_metadata4 tun_metadata5 tun_metadata6 tun_metadata7 tun_metadata8 tun_metadata9 tun_metadata10 tun_metadata11 tun_metadata12 tun_metadata13 tun_metadata14 tun_metadata15 tun_metadata16 tun_metadata17 tun_metadata18 tun_metadata19 tun_metadata20 tun_metadata21 tun_metadata22 tun_metadata23 tun_metadata24 tun_metadata25 tun_metadata26 tun_metadata27 tun_metadata28 tun_metadata29 tun_metadata30 tun_metadata31 tun_metadata32 tun_metadata33 tun_metadata34 tun_metadata35 tun_metadata36 tun_metadata37 tun_metadata38 tun_metadata39 tun_metadata40 tun_metadata41 tun_metadata42 tun_metadata43 tun_metadata44 tun_metadata45 tun_metadata46 tun_metadata47 tun_metadata48 tun_metadata49 tun_metadata50 tun_metadata51 tun_metadata52 tun_metadata53 tun_metadata54 tun_metadata55 tun_metadata56 tun_metadata57 tun_metadata58 tun_metadata59 tun_metadata60 tun_metadata61 tun_metadata62 tun_metadata63 dnl
+-metadata in_port in_port_oxm pkt_mark ct_mark ct_label reg0 reg1 reg2 reg3 reg4 reg5 reg6 reg7 xreg0 xreg1 xreg2 xreg3 eth_src eth_dst vlan_tci vlan_vid vlan_pcp mpls_label mpls_tc mpls_ttl ip_src ip_dst ipv6_src ipv6_dst ipv6_label nw_tos ip_dscp nw_ecn nw_ttl arp_op arp_spa arp_tpa arp_sha arp_tha tcp_src tcp_dst udp_src udp_dst sctp_src sctp_dst icmp_type icmp_code icmpv6_type icmpv6_code nd_target nd_sll nd_tll
++metadata in_port in_port_oxm pkt_mark ct_mark ct_label reg0 reg1 reg2 reg3 reg4 reg5 reg6 reg7 xreg0 xreg1 xreg2 xreg3 eth_src eth_dst vlan_tci vlan_vid vlan_pcp mpls_label mpls_tc mpls_ttl ip_src ip_dst ipv6_src ipv6_dst ipv6_label nw_tos ip_dscp nw_ecn nw_ttl arp_op arp_spa arp_tpa arp_sha arp_tha tcp_src tcp_dst udp_src udp_dst sctp_src sctp_dst icmp_type icmp_code icmpv6_type icmpv6_code nd_target nd_sll nd_tll nsp nsi nshc1 nshc2 nshc3 nshc4 nsh_mdtype nsh_np encap_eth_src encap_eth_dst encap_eth_type
+     matching:
+       dp_hash: arbitrary mask
+       recirc_id: exact match or wildcard
+@@ -1917,6 +1917,17 @@ metadata in_port in_port_oxm pkt_mark ct_mark ct_label reg0 reg1 reg2 reg3 reg4
+       nd_target: arbitrary mask
+       nd_sll: arbitrary mask
+       nd_tll: arbitrary mask
++      nsp: arbitrary mask
++      nsi: arbitrary mask
++      nshc1: arbitrary mask
++      nshc2: arbitrary mask
++      nshc3: arbitrary mask
++      nshc4: arbitrary mask
++      nsh_mdtype: arbitrary mask
++      nsh_np: arbitrary mask
++      encap_eth_src: arbitrary mask
++      encap_eth_dst: arbitrary mask
++      encap_eth_type: exact match or wildcard
+ 
+ ' $1
+ }
+diff --git a/tests/tunnel.at b/tests/tunnel.at
+index 0c033da..d957574 100644
+--- a/tests/tunnel.at
++++ b/tests/tunnel.at
+@@ -412,6 +412,163 @@ AT_CHECK([tail -1 stdout], [0],
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([tunnel - VXLAN-GPE and NSH - Encapsulation - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++ADD_OF_PORTS([br0], [90])
++AT_DATA([flows.txt], [dnl
++in_port=90 actions=resubmit:1,resubmit:2
++in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,output:1
++in_port=2 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,set_field:4->tun_gpe_np,output:2
++])
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),1,set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,vxlan(gpe(np=0x4,flags=0)),flags(df|key))),push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),4790
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([tunnel - VXLAN-GPE and NSH - Decapsulation - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=2,tun_gpe_np=4,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,actions=pop_nsh,output=1
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++		br0 65534/100: (dummy)
++		p1 1/1: (dummy)
++		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(src=1.1.1.1,dst=1.2.3.4,ttl=64,flags(),vxlan(gpe(np=4,flags=0x0c))),in_port(4790),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: pop_nsh,1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([Eth and NSH - Encapsulation - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++ADD_OF_PORTS([br0], [90])
++AT_DATA([flows.txt], [dnl
++in_port=90 actions=resubmit:1,resubmit:2
++in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,push_eth,set_field:0x894f->encap_eth_type,set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:1
++in_port=2 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,output:2
++])
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++[Datapath actions: push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=0),push_eth(encap_eth_type=35151,encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,),1,push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),push_eth(encap_eth_type=35151,encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,),2
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([Eth and NSH - Decapsulation - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=2,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,actions=pop_nsh,pop_eth,output=1
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++		br0 65534/100: (dummy)
++		p1 1/1: (dummy)
++		p2 2/2: (dummy)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(2),encap_eth(encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: pop_eth,pop_nsh,1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([VXLANGPE+NSH to Eth+NSH - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=2,tun_gpe_np=4,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,actions=push_eth,set_field:0x894f->encap_eth_type,set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:1
++
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++		br0 65534/100: (dummy)
++		p1 1/1: (dummy)
++		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(src=1.1.1.1,dst=1.2.3.4,ttl=64,flags(),vxlan(gpe(np=4,flags=0x0c))),in_port(4790),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: push_eth(encap_eth_type=35151,encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,),1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([Eth+NSH to VXLANGPE+NSH - kernel space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=1,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,actions=pop_eth,set_field:0x4->tun_gpe_np,output=2
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++		br0 65534/100: (dummy)
++		p1 1/1: (dummy)
++		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(1),encap_eth(encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa),,nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,vxlan(gpe(np=0x4,flags=0)),flags(df|key))),pop_eth,4790
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++
++
+ AT_SETUP([tunnel - Geneve metadata])
+ OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=geneve \
+                     options:remote_ip=1.1.1.1 ofport_request=1 \
+-- 
+1.9.3
+

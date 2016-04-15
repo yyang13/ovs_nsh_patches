@@ -1,0 +1,2327 @@
+From ec5272ed6684bbd0ae8c38a5e6488414347a941f Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 13 Apr 2016 16:39:27 +0800
+Subject: [PATCH 3/5] Add userspace dataplane nsh support and remove push_eth
+ and pop_eth actions
+
+Signed-off-by: Mengke Liu <mengke.liu@intel.com>
+Signed-off-by: Ricky Li <ricky.li@intel.com>
+Signed-off-by: Johnson Li <johnson.li@intel.com>
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/actions.c                                |  53 +---
+ datapath/flow.c                                   |  50 ++--
+ datapath/flow.h                                   |  16 +-
+ datapath/flow_netlink.c                           |  44 +--
+ datapath/linux/compat/include/linux/openvswitch.h | 112 ++++++--
+ datapath/linux/compat/include/net/vxlan.h         |   9 +-
+ datapath/linux/compat/vxlan.c                     |  15 ++
+ lib/dpif-netdev.c                                 |  30 ++-
+ lib/dpif.c                                        |   2 -
+ lib/flow.c                                        |  99 ++++++-
+ lib/flow.h                                        |  14 +-
+ lib/match.c                                       |  13 +-
+ lib/match.h                                       |   2 +-
+ lib/meta-flow.h                                   |   2 +-
+ lib/netdev-vport.c                                |  76 +++++-
+ lib/netdev-vport.h                                |   6 +
+ lib/nx-match.c                                    |   3 +-
+ lib/odp-execute.c                                 |  23 +-
+ lib/odp-util.c                                    | 314 ++++++----------------
+ lib/odp-util.h                                    |   6 +-
+ lib/ofp-actions.c                                 |  82 +-----
+ lib/ofp-actions.h                                 |   2 -
+ lib/packets.c                                     |  23 ++
+ lib/packets.h                                     |   3 +
+ ofproto/ofproto-dpif-sflow.c                      |   1 -
+ ofproto/ofproto-dpif-upcall.c                     |   8 -
+ ofproto/ofproto-dpif-xlate.c                      |  13 +-
+ ofproto/ofproto-dpif.h                            |   1 -
+ ofproto/tunnel.c                                  |   1 +
+ tests/ofproto.at                                  |   1 -
+ tests/tunnel.at                                   | 189 +++++++++++--
+ 31 files changed, 666 insertions(+), 547 deletions(-)
+
+diff --git a/datapath/actions.c b/datapath/actions.c
+index 16fc58f..7072638 100644
+--- a/datapath/actions.c
++++ b/datapath/actions.c
+@@ -254,10 +254,10 @@ static int push_vlan(struct sk_buff *skb, struct sw_flow_key *key,
+ 
+ static int pop_nsh(struct sk_buff *skb, struct sw_flow_key *key)
+ {
+-	if (!pskb_may_pull(skb, NSH_M_TYPE1_LEN))
++	if (!pskb_may_pull(skb, ETH_NSH_TYPE1_HEADER_SIZE))
+ 		return -ENOMEM;
+ 	else
+-		__skb_pull(skb, NSH_M_TYPE1_LEN);
++		__skb_pull(skb, ETH_NSH_TYPE1_HEADER_SIZE);
+ 
+ 	return 0;
+ }
+@@ -267,48 +267,21 @@ static int push_nsh(struct sk_buff *skb, struct sw_flow_key *key,
+ {
+ 
+ 	if (nsh->nsh_mdtype == NSH_M_TYPE1) {
+-		if (skb_cow_head(skb, NSH_M_TYPE1_LEN) < 0)
+-		return -ENOMEM;
+-
+-		skb_push(skb, NSH_M_TYPE1_LEN);
+-		OVS_CB(skb)->nsh_header = skb->data;
+-		memcpy(OVS_CB(skb)->nsh_header, nsh->header, NSH_M_TYPE1_LEN);
+-	}
+-	else
+-		return -EINVAL;
+-
+-	return 0;
+-}
+-
+-static int pop_eth(struct sk_buff *skb, struct sw_flow_key *key)
+-{
+-	if (!pskb_may_pull(skb, ENCAP_ETH_PUSH_HEADER_SIZE))
+-		return -ENOMEM;
+-	else
+-		__skb_pull(skb, ENCAP_ETH_PUSH_HEADER_SIZE);
+-
+-	return 0;
+-}
+-
+-static int push_eth(struct sk_buff *skb, struct sw_flow_key *key,
+-		     const struct ovs_action_push_eth *encap_eth)
+-{
+-	if (encap_eth->encap_eth_type == htons(ETH_P_NSH)) {
+-		if (skb_cow_head(skb, ENCAP_ETH_PUSH_HEADER_SIZE) < 0)
++		if (skb_cow_head(skb, ETH_NSH_TYPE1_HEADER_SIZE) < 0) {
+ 			return -ENOMEM;
++                }
+ 
+-		skb_push(skb, ENCAP_ETH_PUSH_HEADER_SIZE);
+-		OVS_CB(skb)->encap_eth_header = skb->data;
+-		memcpy(OVS_CB(skb)->encap_eth_header, encap_eth->header, ENCAP_ETH_PUSH_HEADER_SIZE);
++		skb_push(skb, ETH_NSH_TYPE1_HEADER_SIZE);
++		OVS_CB(skb)->encap_eth_header = (struct encap_eth_hdr *)skb->data;
++		OVS_CB(skb)->nsh_header = (struct nsh_hdr *)(skb->data + ENCAP_ETH_LEN);
++		memcpy(skb->data, nsh->header, ETH_NSH_TYPE1_HEADER_SIZE);
+ 	}
+-	else {
++	else
+ 		return -EINVAL;
+-	}
+ 
+ 	return 0;
+ }
+ 
+-
+ /* 'src' is already properly masked. */
+ static void ether_addr_copy_masked(u8 *dst_, const u8 *src_, const u8 *mask_)
+ {
+@@ -1144,14 +1117,6 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			err = pop_nsh(skb, key);
+ 			break;
+ 
+-		case OVS_ACTION_ATTR_PUSH_ETH:
+-			err = push_eth(skb, key, nla_data(a));
+-			break;
+-
+-		case OVS_ACTION_ATTR_POP_ETH:
+-			err = pop_eth(skb, key);
+-			break;
+-
+ 		case OVS_ACTION_ATTR_RECIRC:
+ 			err = execute_recirc(dp, skb, key, a, rem);
+ 			if (nla_is_last(a, rem)) {
+diff --git a/datapath/flow.c b/datapath/flow.c
+index 67b2f1d..e3f33f8 100644
+--- a/datapath/flow.c
++++ b/datapath/flow.c
+@@ -320,8 +320,12 @@ static int parse_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ }
+ 
+ static int parse_nsh(struct sk_buff *skb, struct sw_flow_key *key){
+-	struct nsh_hdr *nsh_hdr = (struct nsh_hdr *)skb->data;
++        struct nsh_hdr *nsh_hdr = NULL;
++
++        OVS_CB(skb)->encap_eth_header = (struct encap_eth_hdr *)skb->data;
++	nsh_hdr = (struct nsh_hdr *)((const char *)skb->data + ENCAP_ETH_LEN);
+ 	OVS_CB(skb)->nsh_header = nsh_hdr;
++	memcpy(&key->nsh.encap_eth_dst, skb->data, ENCAP_ETH_LEN);
+ 	key->nsh.nsh_mdtype = nsh_hdr->base.mdtype;
+ 	if (key->nsh.nsh_mdtype != NSH_M_TYPE1)
+ 		return -EPERM;
+@@ -335,16 +339,6 @@ static int parse_nsh(struct sk_buff *skb, struct sw_flow_key *key){
+ 	return 0;
+ }
+ 
+-static void parse_encap_eth(struct sk_buff *skb, struct sw_flow_key *key){
+-	struct encap_eth_hdr *encap_eth_header = (struct encap_eth_hdr *)skb->data;
+-	OVS_CB(skb)->encap_eth_header = encap_eth_header;
+-	key->encap_eth.encap_eth_type = encap_eth_header->encap_eth_type;
+-	ether_addr_copy(key->encap_eth.encap_eth_src, encap_eth_header->encap_eth_src);
+-	ether_addr_copy(key->encap_eth.encap_eth_dst, encap_eth_header->encap_eth_dst);
+-
+-	return;
+-}
+-
+ static __be16 parse_ethertype(struct sk_buff *skb)
+ {
+ 	struct llc_snap_hdr {
+@@ -483,23 +477,21 @@ static int key_extract(struct sk_buff *skb, struct sw_flow_key *key)
+ {
+ 	int error;
+ 	struct ethhdr *eth;
++        int is_eth_nsh = 0;
+ 
+ 	/* Extract ethernet+nsh if ethernet type is 0x894F */
+ 	eth = (struct ethhdr *)skb->data;
+ 	if (eth->h_proto == htons(ETH_P_NSH)) {
+-		parse_encap_eth(skb, key);
+-		__skb_pull(skb, ENCAP_ETH_LEN);
+-
+ 		if (unlikely(parse_nsh(skb, key)))
+ 			return -EINVAL;
+ 		if (key->nsh.nsh_mdtype == NSH_M_TYPE1 && key->nsh.nsh_np == NSH_P_ETHERNET) {
+-			__skb_pull(skb, NSH_M_TYPE1_LEN);
++			__skb_pull(skb, ENCAP_ETH_LEN + NSH_M_TYPE1_LEN);
++                        is_eth_nsh = 1;
+ 		} else {
+ 			return -EINVAL;
+ 		}
+ 	} else {
+-		void *encap_eth_hdr = &(key->encap_eth);
+-		memset(encap_eth_hdr, 0, ENCAP_ETH_LEN);
++                memset(&key->nsh, 0, sizeof(key->nsh));
+ 	}
+ 
+ 	/* Flags are always used as part of stats */
+@@ -722,15 +714,15 @@ static int key_extract(struct sk_buff *skb, struct sw_flow_key *key)
+ 		}
+ 	}
+ 
+-	if (key->encap_eth.encap_eth_type == htons(ETH_P_NSH))
++        if (is_eth_nsh == 1) {
+ 		__skb_push(skb, ENCAP_ETH_LEN + NSH_M_TYPE1_LEN);
++        }
+ 
+ 	return 0;
+ }
+ 
+-static void ovs_key_nsh_init(struct sw_flow_key *key, __u16 len) {
+-	void *nsh_hdr = &(key->nsh);
+-	memset(nsh_hdr, 0, len);
++static void ovs_key_nsh_init(struct sw_flow_key *key) {
++	memset(&key->nsh, 0, sizeof(key->nsh));
+ }
+ 
+ static int nsh_extract(struct sk_buff *skb, struct sw_flow_key *key) {
+@@ -740,16 +732,16 @@ static int nsh_extract(struct sk_buff *skb, struct sw_flow_key *key) {
+ 	if (unlikely(parse_nsh(skb, key)))
+ 		return -EINVAL;
+ 	if (key->nsh.nsh_mdtype == NSH_M_TYPE1) {
+-		__skb_pull(skb, NSH_M_TYPE1_LEN);
++		__skb_pull(skb, ENCAP_ETH_LEN + NSH_M_TYPE1_LEN);
+ 		if(key->nsh.nsh_np == NSH_P_ETHERNET)
+ 			ret = key_extract(skb, key);
+ 		else
+ 			return -EINVAL;
+-		__skb_push(skb, NSH_M_TYPE1_LEN);
++		__skb_push(skb, ENCAP_ETH_LEN + NSH_M_TYPE1_LEN);
+ 
+ 		return ret;
+ 	} else {
+-		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++		ovs_key_nsh_init(key);
+ 	}
+ 
+ 	return 0;
+@@ -760,7 +752,7 @@ static bool is_nsh_header(const void *tun_opts, __be16 tun_flags) {
+ 	if (tun_opts && (tun_flags & TUNNEL_VXLAN_OPT))
+ 		md = (struct vxlan_metadata *)tun_opts;
+ 
+-	if (md && (md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)
++	if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH))
+ 		return true;
+ 	else
+ 		return false;
+@@ -768,7 +760,7 @@ static bool is_nsh_header(const void *tun_opts, __be16 tun_flags) {
+ 
+ int ovs_flow_key_update(struct sk_buff *skb, struct sw_flow_key *key)
+ {
+-	ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++	ovs_key_nsh_init(key);
+ 	return key_extract(skb, key);
+ }
+ 
+@@ -804,13 +796,13 @@ int ovs_flow_key_extract(const struct ip_tunnel_info *tun_info,
+ 	key->recirc_id = 0;
+ 
+ 	/* Extract NSH and inner Ethernet if NSH header exists */
+-	if (tun_info && is_nsh_header(ip_tunnel_info_opts(tun_info), key->tun_key.tun_flags)) {
++	if (tun_info && is_nsh_header(TUN_METADATA_OPTS(key, key->tun_opts_len), key->tun_key.tun_flags)) {
+ 		int ret ;
+ 		ret = nsh_extract(skb, key);
+ 		if (key->nsh.nsh_mdtype)
+ 			return ret;
+ 	} else {
+-		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++		ovs_key_nsh_init(key);
+ 	}
+ 	return key_extract(skb, key);
+ }
+@@ -833,7 +825,7 @@ int ovs_flow_key_extract_userspace(struct net *net, const struct nlattr *attr,
+ 		if (key->nsh.nsh_mdtype)
+ 			return ret;
+ 	} else {
+-		ovs_key_nsh_init(key, NSH_M_TYPE1_LEN);
++		ovs_key_nsh_init(key);
+ 	}
+ 
+ 	return key_extract(skb, key);
+diff --git a/datapath/flow.h b/datapath/flow.h
+index c8ccd5f..c00144a 100644
+--- a/datapath/flow.h
++++ b/datapath/flow.h
+@@ -63,21 +63,7 @@ struct sw_flow_key {
+ 		u32	skb_mark;	/* SKB mark. */
+ 		u16	in_port;	/* Input switch port (or DP_MAX_PORTS). */
+ 	} __packed phy; /* Safe when right after 'tun_key'. */
+-	struct {
+-		u32 nshc1;      /* NSH context C1-C4 */
+-		u32 nshc2;
+-		u32 nshc3;
+-		u32 nshc4;
+-		u32 nsp;        /* NSH path id */
+-		u8  nsi;        /* NSH index */
+-		u8  nsh_mdtype; /* NSH metadata type */
+-		u8  nsh_np;     /* NSH next protocol */
+-	}__packed nsh; 				/* network service header */
+-	struct {
+-		u8	encap_eth_src[ETH_ALEN];	/* ENCAP ethernet source address. */
+-		u8	encap_eth_dst[ETH_ALEN];	/* ENCAP ethernet destination address. */
+-		u16	encap_eth_type;	    		/* ENCAP ethernet type. */
+-	} encap_eth;
++        struct ovs_key_nsh nsh;         /* network service header */
+ 	u32 ovs_flow_hash;		/* Datapath computed hash value.  */
+ 	u32 recirc_id;			/* Recirculation ID.  */
+ 	struct {
+diff --git a/datapath/flow_netlink.c b/datapath/flow_netlink.c
+index ebfae37..3e26ac5 100644
+--- a/datapath/flow_netlink.c
++++ b/datapath/flow_netlink.c
+@@ -284,7 +284,7 @@ size_t ovs_key_attr_size(void)
+ 	/* Whenever adding new OVS_KEY_ FIELDS, we should consider
+ 	 * updating this function.
+ 	 */
+-	BUILD_BUG_ON(OVS_KEY_ATTR_TUNNEL_INFO != 28);
++	BUILD_BUG_ON(OVS_KEY_ATTR_TUNNEL_INFO != 27);
+ 
+ 	return    nla_total_size(4)   /* OVS_KEY_ATTR_PRIORITY */
+ 		+ nla_total_size(0)   /* OVS_KEY_ATTR_TUNNEL */
+@@ -297,8 +297,7 @@ size_t ovs_key_attr_size(void)
+ 		+ nla_total_size(2)   /* OVS_KEY_ATTR_CT_ZONE */
+ 		+ nla_total_size(4)   /* OVS_KEY_ATTR_CT_MARK */
+ 		+ nla_total_size(16)  /* OVS_KEY_ATTR_CT_LABELS */
+-		+ nla_total_size(24)   /* OVS_KEY_ATTR_NSH */
+-		+ nla_total_size(14)   /* OVS_KEY_ATTR_ENCAP_ETH */
++		+ nla_total_size(40)   /* OVS_KEY_ATTR_NSH */
+ 		+ nla_total_size(12)  /* OVS_KEY_ATTR_ETHERNET */
+ 		+ nla_total_size(2)   /* OVS_KEY_ATTR_ETHERTYPE */
+ 		+ nla_total_size(4)   /* OVS_KEY_ATTR_VLAN */
+@@ -337,7 +336,6 @@ static const struct ovs_len_tbl ovs_key_lens[OVS_KEY_ATTR_MAX + 1] = {
+ 	[OVS_KEY_ATTR_IN_PORT]	 = { .len = sizeof(u32) },
+ 	[OVS_KEY_ATTR_SKB_MARK]	 = { .len = sizeof(u32) },
+ 	[OVS_KEY_ATTR_NSH]	 = { .len = sizeof(struct ovs_key_nsh) },
+-	[OVS_KEY_ATTR_ENCAP_ETH] = { .len = sizeof(struct ovs_key_encap_eth) },
+ 	[OVS_KEY_ATTR_ETHERNET]	 = { .len = sizeof(struct ovs_key_ethernet) },
+ 	[OVS_KEY_ATTR_VLAN]	 = { .len = sizeof(__be16) },
+ 	[OVS_KEY_ATTR_ETHERTYPE] = { .len = sizeof(__be16) },
+@@ -877,6 +875,12 @@ static int ovs_key_from_nlattrs(struct net *net, struct sw_flow_match *match,
+ 		const struct ovs_key_nsh *nsh_key;
+ 
+ 				nsh_key = nla_data(a[OVS_KEY_ATTR_NSH]);
++        SW_FLOW_KEY_MEMCPY(match, nsh.encap_eth_src,
++				nsh_key->encap_eth_src, ETH_ALEN, is_mask);
++        SW_FLOW_KEY_MEMCPY(match, nsh.encap_eth_dst,
++				nsh_key->encap_eth_dst, ETH_ALEN, is_mask);
++        SW_FLOW_KEY_PUT(match, nsh.encap_eth_type,
++                               nsh_key->encap_eth_type, is_mask);
+         SW_FLOW_KEY_PUT(match, nsh.nshc1,
+ 				nsh_key->nshc1, is_mask);
+         SW_FLOW_KEY_PUT(match, nsh.nshc2,
+@@ -896,19 +900,6 @@ static int ovs_key_from_nlattrs(struct net *net, struct sw_flow_match *match,
+ 		attrs &= ~(1ULL << OVS_KEY_ATTR_NSH);
+ 	}
+ 
+-    if (attrs & (1ULL << OVS_KEY_ATTR_ENCAP_ETH)) {
+-        const struct ovs_key_encap_eth *encap_eth_key;
+-
+-        encap_eth_key = nla_data(a[OVS_KEY_ATTR_ENCAP_ETH]);
+-        SW_FLOW_KEY_MEMCPY(match, encap_eth.encap_eth_src,
+-				encap_eth_key->encap_eth_src, ETH_ALEN, is_mask);
+-        SW_FLOW_KEY_MEMCPY(match, encap_eth.encap_eth_dst,
+-				encap_eth_key->encap_eth_dst, ETH_ALEN, is_mask);
+-        SW_FLOW_KEY_PUT(match, encap_eth.encap_eth_type,
+-				encap_eth_key->encap_eth_type, is_mask);
+-        attrs &= ~(1ULL << OVS_KEY_ATTR_ENCAP_ETH);
+-    }
+-
+ 	if (attrs & (1ULL << OVS_KEY_ATTR_ETHERNET)) {
+ 		const struct ovs_key_ethernet *eth_key;
+ 
+@@ -1433,6 +1424,9 @@ static int __ovs_nla_put_key(const struct sw_flow_key *swkey,
+ 		if (!nla)
+ 			goto nla_put_failure;
+ 		nsh_key = nla_data(nla);
++                memcpy(nsh_key->encap_eth_dst, output->nsh.encap_eth_dst, ETH_ALEN);
++                memcpy(nsh_key->encap_eth_src, output->nsh.encap_eth_src, ETH_ALEN);
++                nsh_key->encap_eth_type = output->nsh.encap_eth_type;
+ 		nsh_key->nsi = output->nsh.nsi;
+ 		nsh_key->nsp = output->nsh.nsp;
+ 		nsh_key->nsh_mdtype= output->nsh.nsh_mdtype;
+@@ -1443,18 +1437,6 @@ static int __ovs_nla_put_key(const struct sw_flow_key *swkey,
+ 		nsh_key->nshc4 = output->nsh.nshc4;
+ 	}
+ 
+-	if ((swkey->encap_eth.encap_eth_type || is_mask)) {
+-		struct ovs_key_encap_eth *encap_eth_key;
+-
+-		nla = nla_reserve(skb, OVS_KEY_ATTR_ENCAP_ETH, sizeof(*encap_eth_key));
+-		if (!nla)
+-			goto nla_put_failure;
+-		encap_eth_key = nla_data(nla);
+-		memcpy(encap_eth_key->encap_eth_src, output->encap_eth.encap_eth_src, ETH_ALEN);
+-		memcpy(encap_eth_key->encap_eth_dst, output->encap_eth.encap_eth_dst, ETH_ALEN);
+-		encap_eth_key->encap_eth_type= output->encap_eth.encap_eth_type;
+-	}
+-
+ 	if ((swkey->tun_key.u.ipv4.dst || is_mask)) {
+ 		const void *opts = NULL;
+ 
+@@ -2253,8 +2235,6 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 			[OVS_ACTION_ATTR_POP_VLAN] = 0,
+ 			[OVS_ACTION_ATTR_PUSH_NSH] = sizeof(struct ovs_action_push_nsh),
+ 			[OVS_ACTION_ATTR_POP_NSH] = 0,
+-			[OVS_ACTION_ATTR_PUSH_ETH] = sizeof(struct ovs_action_push_eth),
+-			[OVS_ACTION_ATTR_POP_ETH] = 0,
+ 			[OVS_ACTION_ATTR_SET] = (u32)-1,
+ 			[OVS_ACTION_ATTR_SET_MASKED] = (u32)-1,
+ 			[OVS_ACTION_ATTR_SAMPLE] = (u32)-1,
+@@ -2301,8 +2281,6 @@ static int __ovs_nla_copy_actions(struct net *net, const struct nlattr *attr,
+ 
+ 		case OVS_ACTION_ATTR_PUSH_NSH:
+ 		case OVS_ACTION_ATTR_POP_NSH:
+-		case OVS_ACTION_ATTR_PUSH_ETH:
+-		case OVS_ACTION_ATTR_POP_ETH:
+ 			break;
+ 
+ 		case OVS_ACTION_ATTR_POP_VLAN:
+diff --git a/datapath/linux/compat/include/linux/openvswitch.h b/datapath/linux/compat/include/linux/openvswitch.h
+index 187bb9b..bf1be4e 100644
+--- a/datapath/linux/compat/include/linux/openvswitch.h
++++ b/datapath/linux/compat/include/linux/openvswitch.h
+@@ -331,7 +331,6 @@ enum ovs_key_attr {
+ 	OVS_KEY_ATTR_IN_PORT,   /* u32 OVS dp port number */
+ 	OVS_KEY_ATTR_NSH,		/* struct ovs_key_nsh. Only support NSH MD
+ 					type 1 now */
+-	OVS_KEY_ATTR_ENCAP_ETH,	/* struct ovs_key_encap_eth */
+ 	OVS_KEY_ATTR_ETHERNET,  /* struct ovs_key_ethernet */
+ 	OVS_KEY_ATTR_VLAN,	/* be16 VLAN TCI */
+ 	OVS_KEY_ATTR_ETHERTYPE,	/* be16 Ethernet type */
+@@ -406,6 +405,10 @@ enum ovs_frag_type {
+ #define OVS_FRAG_TYPE_MAX (__OVS_FRAG_TYPE_MAX - 1)
+ 
+ struct ovs_key_nsh {
++	__u8	encap_eth_dst[ETH_ALEN];
++	__u8	encap_eth_src[ETH_ALEN];
++        __u16   encap_eth_type;
++        __u16   pad1;
+ 	__u32	nshc1;
+ 	__u32	nshc2;
+ 	__u32	nshc3;
+@@ -414,14 +417,8 @@ struct ovs_key_nsh {
+ 	__u8	nsi;
+ 	__u8	nsh_mdtype;
+ 	__u8	nsh_np;
+-	__u8 	reserved;
+-};
+-
+-struct ovs_key_encap_eth {
+-	__u8	 encap_eth_src[ETH_ALEN];
+-	__u8	 encap_eth_dst[ETH_ALEN];
+-	__u16    encap_eth_type;
+-};
++	__u8    pad2;
++} __packed;
+ 
+ struct ovs_key_ethernet {
+ 	__u8	 eth_src[ETH_ALEN];
+@@ -652,6 +649,85 @@ struct ovs_action_push_vlan {
+ 	__be16 vlan_tci;	/* 802.1Q TCI (VLAN ID and priority). */
+ };
+ 
++#ifndef __VXLAN_GPE_HEADER
++#define __VXLAN_GPE_HEADER 1
++
++/*
++ * VXLAN Generic Protocol Extension:
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |R|R|Ver|I|P|R|O|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|  Next Proto   |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                VXLAN Network Identifier (VNI) |   Reserved    |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * Ver = Version. Indicates VXLAN GPE protocol version.  The initial
++ *    	 version is 0.  If a receiver does not support the version
++ *    	 indicated it MUST drop the packet.
++ *
++ * I = Instance Bit. The I bit MUST be set to indicate a valid VNI.
++ *
++ * P = Next Protocol Bit. The P bit is set to indicate that the
++ *     Next Protocol field is present.
++ *
++ * O = OAM Flag Bit. The O bit is set to indicate that the packet
++ *     is an OAM packet.
++ *
++ * Next Protocol = This 8 bit field indicates the protocol header
++ *     immediately following the VXLAN GPE header.
++ *
++ * [1] https://www.ietf.org/id/draft-ietf-nvo3-vxlan-gpe-01.txt
++ */
++
++struct vxlanhdr_gpe {
++#ifdef __LITTLE_ENDIAN_BITFIELD
++	uint8_t    oam_flag:1;
++	uint8_t    reserved_flags1:1;
++	uint8_t    np_applied:1;
++	uint8_t    instance_applied:1;
++	uint8_t    gpe_version:2;
++	uint8_t    reserved_flags2:2;
++#elif defined(__BIG_ENDIAN_BITFIELD)
++	uint8_t    reserved_flags2:2;
++	uint8_t    gpe_version:2;
++	uint8_t    instance_applied:1;
++	uint8_t    np_applied:1;
++	uint8_t    reserved_flags1:1;
++	uint8_t    oam_flag:1;
++#else
++#error	"Please fix <asm/byteorder.h>"
++#endif
++    uint8_t    reserved_flags3;
++    uint8_t    reserved_flags4;
++    uint8_t    next_proto;
++    __be32 	   vx_vni;
++};
++
++/* VxLAN-GPE Header Next Protocol */
++#define VXLAN_GPE_NP_IPV4        0x01
++#define VXLAN_GPE_NP_IPV6        0x02
++#define VXLAN_GPE_NP_ETHERNET    0x03
++#define VXLAN_GPE_NP_NSH        0x04
++
++/* skb->mark mapping
++ *
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |R|R|Ver|I|P|R|O|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|R|  Next Proto   |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ */
++
++#define VXLAN_GPE_OAM_FLAG			(1UL << 24)
++#define VXLAN_GPE_NP_APPLIED		(1UL << 26)
++#define VXLAN_GPE_INSTANCE_APPLIED	(1UL << 27)
++#define VXLAN_GPE_VERSION			((1UL << 28) | (1UL << 29))
++
++#define VXLAN_GPE_NP_MASK			(0xFF)
++#define VXLAN_GPE_USED_BITS (VXLAN_GPE_OAM_FLAG | VXLAN_GPE_NP_APPLIED \
++				| VXLAN_GPE_INSTANCE_APPLIED | VXLAN_GPE_VERSION | 0xFF)
++
++#define VXLAN_F_GPE			0x4000
++#define VXLAN_HF_GPE 0x04000000
++
++#endif /* __VXLAN_GPE_HEADER */
++
+ /*
+  * Network Service Header:
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+@@ -769,6 +845,7 @@ struct nsh_hdr {
+ 
+ #define ENCAP_ETH_LEN     14
+ 
++#define ETH_NSH_TYPE1_HEADER_SIZE (NSH_PUSH_TYPE1_HEADER_SIZE + ENCAP_ETH_LEN)
+ /**
+  * struct encap_eth - encap ethernet header for ethernet NSH
+  * @encap_eth_src: encap ethernet source address.
+@@ -781,6 +858,11 @@ struct encap_eth_hdr {
+ 	__u16 encap_eth_type;
+ };
+ 
++struct eth_nsh_hdr {
++    struct encap_eth_hdr encap_eth_header;
++    struct nsh_hdr nsh_hdr  __attribute__((packed));
++};
++
+ #define ENCAP_ETH_PUSH_HEADER_SIZE 14
+ /**
+  * struct ovs_action_push_nsh - %OVS_ACTION_ATTR_PUSH_NSH action argument.
+@@ -791,15 +873,6 @@ struct ovs_action_push_nsh {
+ 	uint8_t  header[NSH_PUSH_HEADER_SIZE];
+ };
+ 
+-/**
+- * struct ovs_action_push_nsh - %OVS_ACTION_ATTR_PUSH_NSH action argument.
+- * @header
+- */
+-struct ovs_action_push_eth {
+-	uint16_t  encap_eth_type;
+-	uint8_t  header[ENCAP_ETH_PUSH_HEADER_SIZE];
+-};
+-
+ /* Data path hash algorithm for computing Datapath hash.
+  *
+  * The algorithm type only specifies the fields in a flow
+@@ -839,6 +912,7 @@ struct ovs_action_push_tnl {
+ 	uint32_t out_port;
+ 	uint32_t header_len;
+ 	uint32_t tnl_type;     /* For logging. */
++    uint32_t exts;
+ 	uint8_t  header[TNL_PUSH_HEADER_SIZE];
+ };
+ #endif
+@@ -965,8 +1039,6 @@ enum ovs_action_attr {
+ 	OVS_ACTION_ATTR_POP_VLAN,     /* No argument. */
+ 	OVS_ACTION_ATTR_PUSH_NSH,     /* struct ovs_action_push_nsh. */
+ 	OVS_ACTION_ATTR_POP_NSH,      /* No argument. */
+-	OVS_ACTION_ATTR_PUSH_ETH,     /* struct ovs_action_push_eth. */
+-	OVS_ACTION_ATTR_POP_ETH,      /* No argument. */
+ 	OVS_ACTION_ATTR_SAMPLE,       /* Nested OVS_SAMPLE_ATTR_*. */
+ 	OVS_ACTION_ATTR_RECIRC,       /* u32 recirc_id. */
+ 	OVS_ACTION_ATTR_HASH,	      /* struct ovs_action_hash. */
+diff --git a/datapath/linux/compat/include/net/vxlan.h b/datapath/linux/compat/include/net/vxlan.h
+index 3aeac88..31f9e5e 100644
+--- a/datapath/linux/compat/include/net/vxlan.h
++++ b/datapath/linux/compat/include/net/vxlan.h
+@@ -84,6 +84,8 @@ struct vxlanhdr_gbp {
+ #define VXLAN_GBP_POLICY_APPLIED	(BIT(3) << 16)
+ #define VXLAN_GBP_ID_MASK		(0xFFFF)
+ 
++#ifndef __VXLAN_GPE_HEADER
++#define __VXLAN_GPE_HEADER 1
+ /*
+  * VXLAN Generic Protocol Extension:
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+@@ -156,6 +158,11 @@ struct vxlanhdr_gpe {
+ #define VXLAN_GPE_USED_BITS (VXLAN_GPE_OAM_FLAG | VXLAN_GPE_NP_APPLIED \
+                            | VXLAN_GPE_INSTANCE_APPLIED | VXLAN_GPE_VERSION | 0xFF)
+ 
++#define VXLAN_HF_GPE BIT(26)
++#define VXLAN_F_GPE                     0x4000
++
++#endif /* __VXLAN_GPE_HEADER */
++
+ /* VXLAN protocol header:
+  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  * |G|R|R|R|I|R|R|C|               Reserved                        |
+@@ -176,7 +183,6 @@ struct vxlanhdr {
+ #define VXLAN_HF_RCO BIT(21)
+ #define VXLAN_HF_VNI BIT(27)
+ #define VXLAN_HF_GBP BIT(31)
+-#define VXLAN_HF_GPE BIT(26)
+ 
+ /* Remote checksum offload header option */
+ #define VXLAN_RCO_MASK  0x7f    /* Last byte of vni field */
+@@ -279,7 +285,6 @@ struct vxlan_dev {
+ #define VXLAN_F_GBP			0x800
+ #define VXLAN_F_REMCSUM_NOPARTIAL	0x1000
+ #define VXLAN_F_COLLECT_METADATA	0x2000
+-#define VXLAN_F_GPE                     0x4000
+ 
+ /* Flags that are used in the receive path. These flags must match in
+  * order for a socket to be shareable
+diff --git a/datapath/linux/compat/vxlan.c b/datapath/linux/compat/vxlan.c
+index 7ef051c..888d431 100644
+--- a/datapath/linux/compat/vxlan.c
++++ b/datapath/linux/compat/vxlan.c
+@@ -821,6 +821,7 @@ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ 	struct vxlan_dev *vxlan;
+ 	struct pcpu_sw_netstats *stats;
+ 	union vxlan_addr saddr;
++        struct eth_nsh_hdr *eth_nsh_header = NULL;
+ 	int err = 0;
+ 
+ 	/* For flow based devices, map all packets to VNI 0 */
+@@ -888,6 +889,15 @@ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ 	stats->rx_packets++;
+ 	stats->rx_bytes += skb->len;
+ 	u64_stats_update_end(&stats->syncp);
++
++        /* Add a faked encap_eth_header for NSH */
++        if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
++            skb_push(skb, ENCAP_ETH_LEN);
++            eth_nsh_header = (struct eth_nsh_hdr *)skb->data;
++            memmove(eth_nsh_header->encap_eth_header.encap_eth_dst, skb_mac_header(skb), ENCAP_ETH_LEN);
++            eth_nsh_header->encap_eth_header.encap_eth_type = htons(ETH_P_NSH);
++        }
++ 
+ 	netdev_port_receive(skb, skb_tunnel_info(skb));
+ 	return;
+ drop:
+@@ -1178,6 +1188,11 @@ static int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *sk
+ 		}
+ 	}
+ 
++        /* Skip encap_eth_header on sending Eth+NSH to vxlan-gpe port */
++        if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
++            skb_pull(skb, ENCAP_ETH_LEN);
++        }
++
+ 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+ 			+ VXLAN_HLEN + sizeof(struct iphdr)
+ 			+ (skb_vlan_tag_present(skb) ? VLAN_HLEN : 0);
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 8e67bfd..d40cae4 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -467,7 +467,7 @@ static int get_port_by_name(struct dp_netdev *dp, const char *devname,
+ static void dp_netdev_free(struct dp_netdev *)
+     OVS_REQUIRES(dp_netdev_mutex);
+ static int do_add_port(struct dp_netdev *dp, const char *devname,
+-                       const char *type, odp_port_t port_no)
++                       const char *type, odp_port_t port_no, uint32_t exts)
+     OVS_REQUIRES(dp->port_mutex);
+ static void do_del_port(struct dp_netdev *dp, struct dp_netdev_port *)
+     OVS_REQUIRES(dp->port_mutex);
+@@ -914,7 +914,7 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
+     dp_netdev_set_nonpmd(dp);
+ 
+     ovs_mutex_lock(&dp->port_mutex);
+-    error = do_add_port(dp, name, "internal", ODPP_LOCAL);
++    error = do_add_port(dp, name, "internal", ODPP_LOCAL, 0);
+     ovs_mutex_unlock(&dp->port_mutex);
+     if (error) {
+         dp_netdev_free(dp);
+@@ -1096,9 +1096,21 @@ hash_port_no(odp_port_t port_no)
+     return hash_int(odp_to_u32(port_no), 0);
+ }
+ 
++static void add_vxlan_gpe_exts(struct netdev *netdev, uint32_t exts)
++{
++    const char *type = netdev_get_type(netdev);
++    if (!strcmp(type, "vxlan")) {
++        struct netdev_tunnel_config *cfg;
++        cfg = netdev_get_tunnel_config(netdev);
++
++        if(exts & (1 << OVS_VXLAN_EXT_GPE))
++            cfg->exts |= (1 << OVS_VXLAN_EXT_GPE);
++    }
++}
++
+ static int
+ do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
+-            odp_port_t port_no)
++            odp_port_t port_no, uint32_t exts)
+     OVS_REQUIRES(dp->port_mutex)
+ {
+     struct netdev_saved_flags *sf;
+@@ -1145,7 +1157,8 @@ do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
+             VLOG_ERR("%s, cannot set multiq", devname);
+             return errno;
+         }
+-    }
++    } 
++    add_vxlan_gpe_exts(netdev, exts);
+     port = xzalloc(sizeof *port);
+     port->port_no = port_no;
+     port->netdev = netdev;
+@@ -1211,7 +1224,12 @@ dpif_netdev_port_add(struct dpif *dpif, struct netdev *netdev,
+     }
+     if (!error) {
+         *port_nop = port_no;
+-        error = do_add_port(dp, dpif_port, netdev_get_type(netdev), port_no);
++        const struct netdev_tunnel_config *cfg;
++        uint32_t exts = 0;
++        cfg = netdev_get_tunnel_config(netdev);
++        if (cfg)
++            exts = cfg->exts;
++        error = do_add_port(dp, dpif_port, netdev_get_type(netdev), port_no, exts);
+     }
+     ovs_mutex_unlock(&dp->port_mutex);
+ 
+@@ -3876,8 +3894,6 @@ dp_execute_cb(void *aux_, struct dp_packet **packets, int cnt,
+ 
+     case OVS_ACTION_ATTR_PUSH_NSH:
+     case OVS_ACTION_ATTR_POP_NSH:
+-    case OVS_ACTION_ATTR_PUSH_ETH:
+-    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_PUSH_MPLS:
+diff --git a/lib/dpif.c b/lib/dpif.c
+index b5265c4..481f0f9 100644
+--- a/lib/dpif.c
++++ b/lib/dpif.c
+@@ -1141,8 +1141,6 @@ dpif_execute_helper_cb(void *aux_, struct dp_packet **packets, int cnt,
+     case OVS_ACTION_ATTR_HASH:
+     case OVS_ACTION_ATTR_PUSH_NSH:
+     case OVS_ACTION_ATTR_POP_NSH:
+-    case OVS_ACTION_ATTR_PUSH_ETH:
+-    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_PUSH_MPLS:
+diff --git a/lib/flow.c b/lib/flow.c
+index fc8b98c..887b023 100644
+--- a/lib/flow.c
++++ b/lib/flow.c
+@@ -470,6 +470,25 @@ flow_extract(struct dp_packet *packet, struct flow *flow)
+     miniflow_expand(&m.mf, flow);
+ }
+ 
++/* parse Ethernet+NSH */
++static int parse_nsh(const void *data, struct ovs_key_nsh *nsh)
++{
++    memcpy(&nsh->encap_eth_dst, data, ENCAP_ETH_LEN);
++    const struct nsh_hdr *nsh_hdr = (const struct nsh_hdr *)((const char *)data + ENCAP_ETH_LEN);
++    
++    nsh->nsh_mdtype = nsh_hdr->base.mdtype;
++    if (nsh->nsh_mdtype != NSH_M_TYPE1)
++    	return -1;
++    nsh->nsh_np = nsh_hdr->base.proto;
++    nsh->nsi = nsh_hdr->base.svc_idx;
++    nsh->nsp = nsh_hdr->base.path_hdr << 8;
++    nsh->nshc1 = nsh_hdr->ctx.nshc1;
++    nsh->nshc2 = nsh_hdr->ctx.nshc2;
++    nsh->nshc3 = nsh_hdr->ctx.nshc3;
++    nsh->nshc4 = nsh_hdr->ctx.nshc4;
++    return 0;
++}
++
+ /* Caller is responsible for initializing 'dst' with enough storage for
+  * FLOW_U64S * 8 bytes. */
+ void
+@@ -530,6 +549,32 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
+         }
+     }
+ 
++    /* Extract Etherenet + NSH if the Ethernet type is 0x894F in packet */
++    if (OVS_UNLIKELY(size < sizeof(struct eth_header)))
++        goto out;
++    else {
++        const struct eth_header *eth = data;
++        if (eth->eth_type == htons(ETH_P_NSH)) {
++            /* extract Ethernet+nsh */
++            struct ovs_key_nsh nsh;
++            if (OVS_UNLIKELY(parse_nsh(data, &nsh)))
++                goto out;
++
++            /* Now only support NSH mdtype 1 */
++            if (nsh.nsh_mdtype == NSH_M_TYPE1){
++                /* Push all field related with Ethernet+nsh at once. */
++                miniflow_push_words(mf, encap_eth_dst, &nsh,
++                       (sizeof (struct ovs_key_nsh)+sizeof(uint64_t) - 1) /
++                       sizeof(uint64_t));
++                data = (const char *)data + NSH_M_TYPE1_LEN + ENCAP_ETH_LEN;
++            } else 
++                goto out;
++
++    		if(nsh.nsh_np != NSH_P_ETHERNET)
++    			goto out;
++        }
++    }
++    
+     /* Initialize packet's layer pointer and offsets. */
+     l2 = data;
+     dp_packet_reset_offsets(packet);
+@@ -1291,6 +1336,9 @@ void flow_wildcards_init_for_packet(struct flow_wildcards *wc,
+ 
+     /* NSH fields wildcarded */
+     if (flow->nsh_mdtype) {
++        WC_MASK_FIELD(wc, encap_eth_src);
++        WC_MASK_FIELD(wc, encap_eth_dst);
++        WC_MASK_FIELD(wc, encap_eth_type);
+         WC_MASK_FIELD(wc, nshc1);
+         WC_MASK_FIELD(wc, nshc2);
+         WC_MASK_FIELD(wc, nshc3);
+@@ -1301,13 +1349,6 @@ void flow_wildcards_init_for_packet(struct flow_wildcards *wc,
+         WC_MASK_FIELD(wc, nsi);
+     }
+ 
+-    /* ENCAP Eth wildcarded */
+-    if (flow->encap_eth_type) {
+-        WC_MASK_FIELD(wc, encap_eth_src);
+-        WC_MASK_FIELD(wc, encap_eth_dst);
+-        WC_MASK_FIELD(wc, encap_eth_type);
+-    }
+-
+     /* metadata, regs, and conj_id wildcarded. */
+ 
+     WC_MASK_FIELD(wc, skb_priority);
+@@ -1424,6 +1465,19 @@ flow_wc_map(const struct flow *flow, struct flowmap *map)
+     FLOWMAP_SET(map, ct_mark);
+     FLOWMAP_SET(map, ct_label);
+ 
++    /* NSH fields */
++    FLOWMAP_SET(map, encap_eth_src);
++    FLOWMAP_SET(map, encap_eth_dst);
++    FLOWMAP_SET(map, encap_eth_type);
++    FLOWMAP_SET(map, nshc1);
++    FLOWMAP_SET(map, nshc2);
++    FLOWMAP_SET(map, nshc3);
++    FLOWMAP_SET(map, nshc4);
++    FLOWMAP_SET(map, nsp);
++    FLOWMAP_SET(map, nsi);
++    FLOWMAP_SET(map, nsh_mdtype);
++    FLOWMAP_SET(map, nsh_np);
++
+     /* Ethertype-dependent fields. */
+     if (OVS_LIKELY(flow->dl_type == htons(ETH_TYPE_IP))) {
+         FLOWMAP_SET(map, nw_src);
+@@ -2271,6 +2325,33 @@ flow_compose_l4(struct dp_packet *p, const struct flow *flow)
+     return l4_len;
+ }
+ 
++/* push ethernet+nsh header at the beginning of packets */
++static void
++flow_compose_nsh(struct dp_packet *p, const struct flow *flow)
++{
++    struct eth_nsh_hdr *eth_nsh_header;
++
++    /* Now only support mdtype1 */
++    if (flow->nsh_mdtype != NSH_M_TYPE1)
++        return;
++
++    eth_nsh_header = dp_packet_push_uninit(p, ETH_NSH_TYPE1_HEADER_SIZE);
++    eth_nsh_header->encap_eth_header.encap_eth_dst = flow->encap_eth_dst;
++    eth_nsh_header->encap_eth_header.encap_eth_src = flow->encap_eth_src;
++    eth_nsh_header->encap_eth_header.encap_eth_type = htons(ETH_P_NSH);  
++
++    memset(&eth_nsh_header->nsh_hdr, 0, sizeof (struct nsh_hdr));
++    eth_nsh_header->nsh_hdr.base.length = 6;
++    eth_nsh_header->nsh_hdr.base.proto = flow->nsh_np;
++    eth_nsh_header->nsh_hdr.base.mdtype = flow->nsh_mdtype;
++    eth_nsh_header->nsh_hdr.base.proto = flow->nsh_np;
++    eth_nsh_header->nsh_hdr.base.path_hdr = flow->nsp >> 8 | flow->nsi << 24;
++    eth_nsh_header->nsh_hdr.ctx.nshc1 = flow->nshc1;
++    eth_nsh_header->nsh_hdr.ctx.nshc2 = flow->nshc2;
++    eth_nsh_header->nsh_hdr.ctx.nshc3 = flow->nshc3;
++    eth_nsh_header->nsh_hdr.ctx.nshc4 = flow->nshc4;
++}
++
+ /* Puts into 'b' a packet that flow_extract() would parse as having the given
+  * 'flow'.
+  *
+@@ -2371,6 +2452,10 @@ flow_compose(struct dp_packet *p, const struct flow *flow)
+             push_mpls(p, flow->dl_type, flow->mpls_lse[--n]);
+         }
+     }
++
++    if (flow->nsh_mdtype) {
++        flow_compose_nsh(p, flow);
++    }
+ }
+ 
+ /* Compressed flow. */
+diff --git a/lib/flow.h b/lib/flow.h
+index a8677b1..31a2a16 100644
+--- a/lib/flow.h
++++ b/lib/flow.h
+@@ -111,7 +111,11 @@ struct flow {
+     ofp_port_t actset_output;   /* Output port in action set. */
+     uint8_t pad2[2];            /* Pad to 64 bits. */
+ 
+-    /* NSH (64-bit aligned) */
++    /* ETH + NSH (64-bit aligned) */
++    struct eth_addr encap_eth_dst;     /* Encap ethernet destination address. */
++    struct eth_addr encap_eth_src;     /* Encap ethernet source address. */
++    ovs_be16 encap_eth_type;           /* Encap ethernet frame type. */
++    uint8_t pad3[2];                   /* Pad to 64 bits. */
+     ovs_be32 nshc1;
+     ovs_be32 nshc2;
+     ovs_be32 nshc3;
+@@ -120,13 +124,7 @@ struct flow {
+     uint8_t nsi;
+     uint8_t nsh_mdtype;
+     uint8_t nsh_np;
+-    uint8_t pad3;
+-
+-    /* ENCAP_ETH (64-bit aligned) */
+-    struct eth_addr encap_eth_src;     /* Encap ethernet source address. */
+-    struct eth_addr encap_eth_dst;     /* Encap ethernet destination address. */
+-    ovs_be16 encap_eth_type;           /* Encap ethernet frame type. */
+-    uint8_t pad4[2];
++    uint8_t pad4;
+ 
+     /* L2, Order the same as in the Ethernet header! (64-bit aligned) */
+     struct eth_addr dl_dst;     /* Ethernet destination address. */
+diff --git a/lib/match.c b/lib/match.c
+index 3db2a2b..2b6648d 100644
+--- a/lib/match.c
++++ b/lib/match.c
+@@ -1002,12 +1002,12 @@ match_set_encap_eth_dst(struct match *match, const struct eth_addr encap_eth_dst
+ }
+ 
+ void
+-match_set_encap_eth_type(struct match *match, uint16_t encap_eth_type)
++match_set_encap_eth_type(struct match *match, ovs_be16 encap_eth_type)
+ {
+-    match_set_encap_eth_type_masked(match, encap_eth_type, UINT16_MAX);
++    match->wc.masks.encap_eth_type = OVS_BE16_MAX;
++    match->flow.encap_eth_type = encap_eth_type;
+ }
+ 
+-
+ /* Returns true if 'a' and 'b' wildcard the same fields and have the same
+  * values for fixed fields, otherwise false. */
+ bool
+@@ -1338,12 +1338,11 @@ match_format(const struct match *match, struct ds *s, int priority)
+                              wc->masks.nshc4);
+     }
+ 
+-    if (wc->masks.encap_eth_type) {
+-        ds_put_format(s, "encap_eth_type=%"PRIu16",", f->encap_eth_type);
+-    }
+-
+     format_eth_masked(s, "encap_eth_src", f->encap_eth_src, wc->masks.encap_eth_src);
+     format_eth_masked(s, "encap_eth_dst", f->encap_eth_dst, wc->masks.encap_eth_dst);
++    if (wc->masks.encap_eth_type) {
++        ds_put_format(s, "encap_eth_type=0x%04"PRIx16",", ntohs(f->encap_eth_type));
++    }
+ 
+     if (wc->masks.dl_type) {
+         skip_type = true;
+diff --git a/lib/match.h b/lib/match.h
+index 529350e..bf27d38 100644
+--- a/lib/match.h
++++ b/lib/match.h
+@@ -187,7 +187,7 @@ void match_set_nshc3(struct match *, ovs_be32 nshc3);
+ void match_set_nshc4(struct match *, ovs_be32 nshc4);
+ void match_set_encap_eth_src(struct match *match, const struct eth_addr encap_eth_src);
+ void match_set_encap_eth_dst(struct match *match, const struct eth_addr encap_eth_dst);
+-void match_set_encap_eth_type(struct match *match, uint16_t encap_eth_type);
++void match_set_encap_eth_type(struct match *match, ovs_be16 encap_eth_type);
+ 
+ bool match_equal(const struct match *, const struct match *);
+ uint32_t match_hash(const struct match *, uint32_t basis);
+diff --git a/lib/meta-flow.h b/lib/meta-flow.h
+index a226b79..4c49adb 100644
+--- a/lib/meta-flow.h
++++ b/lib/meta-flow.h
+@@ -1915,7 +1915,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Maskable: no.
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+-     * Access: read/write.
++     * Access: read-only.
+      * NXM: NXM_NX_ENCAP_ETH_TYPE(123) since v1.1.
+      * OXM: none.
+      */
+diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
+index 406a492..67a020a 100644
+--- a/lib/netdev-vport.c
++++ b/lib/netdev-vport.c
+@@ -584,12 +584,12 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
+                 if (!strcmp(type, "vxlan") && !strcmp(ext, "gbp")) {
+                     if (tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GPE))
+                         VLOG_WARN("VXLAN_GPE extension exists, VxLAN_GBP extension can't be added.");
+-		    else
++                    else
+                         tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GBP);
+                 } else if (!strcmp(type, "vxlan") && !strcmp(ext, "gpe")) {
+                     if (tnl_cfg.exts & (1 << OVS_VXLAN_EXT_GBP))
+                         VLOG_WARN("VXLAN_GBP extension exists, VxLAN_GPE extension can't be added.");
+-		    else
++                    else
+                         tnl_cfg.exts |= (1 << OVS_VXLAN_EXT_GPE);
+                 } else {
+                     VLOG_WARN("%s: unknown extension '%s'", name, ext);
+@@ -1048,6 +1048,9 @@ push_udp_header(struct dp_packet *packet,
+     struct udp_header *udp;
+     int ip_tot_size;
+ 
++    if (data->tnl_type == OVS_VPORT_TYPE_VXLAN && data->exts & 1 << VXLAN_GPE_POP_ETH)
++        dp_packet_reset_packet(packet, ENCAP_ETH_LEN);
++
+     udp = push_ip_header(packet, data->header, data->header_len, &ip_tot_size);
+ 
+     /* set udp src port */
+@@ -1294,6 +1297,7 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
+     struct flow_tnl *tnl = &md->tunnel;
+     struct vxlanhdr *vxh;
+     unsigned int hlen;
++    ovs_be32 flag;
+ 
+     pkt_metadata_init_tnl(md);
+     if (VXLAN_HLEN > dp_packet_l4_size(packet)) {
+@@ -1305,17 +1309,42 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
+         return EINVAL;
+     }
+ 
+-    if (get_16aligned_be32(&vxh->vx_flags) != htonl(VXLAN_FLAGS) ||
+-       (get_16aligned_be32(&vxh->vx_vni) & htonl(0xff))) {
+-        VLOG_WARN_RL(&err_rl, "invalid vxlan flags=%#x vni=%#x\n",
+-                     ntohl(get_16aligned_be32(&vxh->vx_flags)),
+-                     ntohl(get_16aligned_be32(&vxh->vx_vni)));
+-        return EINVAL;
+-    }
+-    tnl->tun_id = htonll(ntohl(get_16aligned_be32(&vxh->vx_vni)) >> 8);
+-    tnl->flags |= FLOW_TNL_F_KEY;
+ 
+-    dp_packet_reset_packet(packet, hlen + VXLAN_HLEN);
++    /* vxlan-gpe packets*/
++    flag = get_16aligned_be32(&vxh->vx_flags);
++
++    if (flag & VXLAN_HF_GPE) {
++        flag &= ~VXLAN_GPE_USED_BITS;
++        if ((flag & ~VXLAN_GPE_USED_BITS) ||
++            get_16aligned_be32(&vxh->vx_vni) & htonl(0xff)) {
++
++            VLOG_WARN_RL(&err_rl, "invalid vxlan flags=%#x vni=%#x\n for vxlan-gpe",
++            ntohl(get_16aligned_be32(&vxh->vx_flags)),
++            ntohl(get_16aligned_be32(&vxh->vx_vni)));
++            return EINVAL;
++        }
++
++        struct vxlanhdr_gpe *gpe;
++
++        gpe = (struct vxlanhdr_gpe *)vxh;
++        tnl->gpe_np = gpe->next_proto;
++
++        /* Drop the OAM packets */
++        if (gpe->oam_flag)
++            return EINVAL;
++    } else {
++        if (flag != htonl(VXLAN_FLAGS) ||
++           (get_16aligned_be32(&vxh->vx_vni) & htonl(0xff))) {
++            VLOG_WARN_RL(&err_rl, "invalid vxlan flags=%#x vni=%#x\n",
++                         ntohl(get_16aligned_be32(&vxh->vx_flags)),
++                         ntohl(get_16aligned_be32(&vxh->vx_vni)));
++            return EINVAL;
++        }
++        tnl->tun_id = htonll(ntohl(get_16aligned_be32(&vxh->vx_vni)) >> 8);
++        tnl->flags |= FLOW_TNL_F_KEY;
++
++        dp_packet_reset_packet(packet, hlen + VXLAN_HLEN);
++    }
+ 
+     return 0;
+ }
+@@ -1336,8 +1365,27 @@ netdev_vxlan_build_header(const struct netdev *netdev,
+ 
+     vxh = udp_build_header(tnl_cfg, tnl_flow, data, &hlen);
+ 
+-    put_16aligned_be32(&vxh->vx_flags, htonl(VXLAN_FLAGS));
+-    put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(tnl_flow->tunnel.tun_id) << 8));
++    if(tnl_cfg->exts & (1 << OVS_VXLAN_EXT_GPE)) {
++        struct vxlanhdr_gpe *gpe;
++
++        gpe = (struct vxlanhdr_gpe *)vxh;
++        put_16aligned_be32(&vxh->vx_flags, htonl(VXLAN_FLAGS | VXLAN_HF_GPE));
++        put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(tnl_flow->tunnel.tun_id) << 8));
++
++        if (!tnl_flow->tunnel.gpe_np)
++    		return -1;
++        else
++            gpe->next_proto = tnl_flow->tunnel.gpe_np;
++
++        if (tnl_flow->tunnel.gpe_flags & 0x01)
++		    gpe->oam_flag = 1;
++
++        if (tnl_flow->tunnel.gpe_np == VXLAN_GPE_NP_NSH)
++            data->exts |= 1 << VXLAN_GPE_POP_ETH;
++    } else {
++        put_16aligned_be32(&vxh->vx_flags, htonl(VXLAN_FLAGS));
++        put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(tnl_flow->tunnel.tun_id) << 8));
++    }
+ 
+     ovs_mutex_unlock(&dev->mutex);
+     data->header_len = hlen + VXLAN_HLEN;
+diff --git a/lib/netdev-vport.h b/lib/netdev-vport.h
+index be02cb5..a6975de 100644
+--- a/lib/netdev-vport.h
++++ b/lib/netdev-vport.h
+@@ -48,6 +48,12 @@ enum { NETDEV_VPORT_NAME_BUFSIZE = 16 };
+ #else
+ enum { NETDEV_VPORT_NAME_BUFSIZE = 256 };
+ #endif
++
++enum OVS_ACTION_PUSH_VXLAN_EXTS {
++    VXLAN_GPE_POP_ETH,      /* Pop ethernet header when the field next_proto
++                             * is 4 in vxlan-gpe header
++                             */
++};
+ const char *netdev_vport_get_dpif_port(const struct netdev *,
+                                        char namebuf[], size_t bufsize)
+     OVS_WARN_UNUSED_RESULT;
+diff --git a/lib/nx-match.c b/lib/nx-match.c
+index 8d2bc4b..c17057f 100644
+--- a/lib/nx-match.c
++++ b/lib/nx-match.c
+@@ -959,14 +959,13 @@ nx_put_raw(struct ofpbuf *b, enum ofp_version oxm, const struct match *match,
+     nxm_put_32m(b, MFF_NSH_C3, oxm, flow->nshc3, match->wc.masks.nshc3);
+     nxm_put_32m(b, MFF_NSH_C4, oxm, flow->nshc4, match->wc.masks.nshc4);
+ 
+-    /* ENCAP Eth */
+     nxm_put_eth_masked(b, MFF_ENCAP_ETH_SRC, oxm,
+                        flow->encap_eth_src, match->wc.masks.encap_eth_src);
+     nxm_put_eth_masked(b, MFF_ENCAP_ETH_DST, oxm,
+                        flow->encap_eth_dst, match->wc.masks.encap_eth_dst);
+     nxm_put_16m(b, MFF_ENCAP_ETH_TYPE, oxm,
+                 ofputil_dl_type_to_openflow(flow->encap_eth_type),
+-                match->wc.masks.encap_eth_type); //uncertain
++                match->wc.masks.encap_eth_type);
+ 
+     /* Ethernet. */
+     nxm_put_eth_masked(b, MFF_ETH_SRC, oxm,
+diff --git a/lib/odp-execute.c b/lib/odp-execute.c
+index b6dcd98..342bbaf 100644
+--- a/lib/odp-execute.c
++++ b/lib/odp-execute.c
+@@ -338,6 +338,7 @@ odp_execute_set_action(struct dp_packet *packet, const struct nlattr *a)
+     case OVS_KEY_ATTR_CT_ZONE:
+     case OVS_KEY_ATTR_CT_MARK:
+     case OVS_KEY_ATTR_CT_LABELS:
++    case OVS_KEY_ATTR_NSH:
+     case __OVS_KEY_ATTR_MAX:
+     default:
+         OVS_NOT_REACHED();
+@@ -435,7 +436,6 @@ odp_execute_masked_set_action(struct dp_packet *packet,
+     case OVS_KEY_ATTR_IN_PORT:
+     case OVS_KEY_ATTR_VLAN:
+     case OVS_KEY_ATTR_NSH:
+-    case OVS_KEY_ATTR_ENCAP_ETH:
+     case OVS_KEY_ATTR_ICMP:
+     case OVS_KEY_ATTR_ICMPV6:
+     case OVS_KEY_ATTR_TCP_FLAGS:
+@@ -501,8 +501,6 @@ requires_datapath_assistance(const struct nlattr *a)
+     case OVS_ACTION_ATTR_SET_MASKED:
+     case OVS_ACTION_ATTR_PUSH_NSH:
+     case OVS_ACTION_ATTR_POP_NSH:
+-    case OVS_ACTION_ATTR_PUSH_ETH:
+-    case OVS_ACTION_ATTR_POP_ETH:
+     case OVS_ACTION_ATTR_PUSH_VLAN:
+     case OVS_ACTION_ATTR_POP_VLAN:
+     case OVS_ACTION_ATTR_SAMPLE:
+@@ -589,6 +587,21 @@ odp_execute_actions(void *dp, struct dp_packet **packets, int cnt, bool steal,
+             }
+             break;
+ 
++        case OVS_ACTION_ATTR_PUSH_NSH: {
++            const void *push_nsh_hdr = nl_attr_get(a);
++
++            for (i = 0; i < cnt; i++) {
++                push_nsh(packets[i], push_nsh_hdr);
++            }
++            break;
++        }
++
++        case OVS_ACTION_ATTR_POP_NSH:
++            for (i = 0; i < cnt; i++) {
++                pop_nsh(packets[i]);
++            }
++            break;
++
+         case OVS_ACTION_ATTR_PUSH_MPLS: {
+             const struct ovs_action_push_mpls *mpls = nl_attr_get(a);
+ 
+@@ -629,10 +642,6 @@ odp_execute_actions(void *dp, struct dp_packet **packets, int cnt, bool steal,
+             }
+             break;
+ 
+-        case OVS_ACTION_ATTR_PUSH_NSH:
+-        case OVS_ACTION_ATTR_POP_NSH:
+-        case OVS_ACTION_ATTR_PUSH_ETH:
+-        case OVS_ACTION_ATTR_POP_ETH:
+         case OVS_ACTION_ATTR_OUTPUT:
+         case OVS_ACTION_ATTR_TUNNEL_PUSH:
+         case OVS_ACTION_ATTR_TUNNEL_POP:
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 102dfd7..7721cc4 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -115,8 +115,6 @@ odp_action_len(uint16_t type)
+     case OVS_ACTION_ATTR_POP_VLAN: return 0;
+     case OVS_ACTION_ATTR_PUSH_NSH: return sizeof(struct ovs_action_push_nsh);
+     case OVS_ACTION_ATTR_POP_NSH: return 0;
+-    case OVS_ACTION_ATTR_PUSH_ETH: return sizeof(struct ovs_action_push_eth);
+-    case OVS_ACTION_ATTR_POP_ETH: return 0;
+     case OVS_ACTION_ATTR_PUSH_MPLS: return sizeof(struct ovs_action_push_mpls);
+     case OVS_ACTION_ATTR_POP_MPLS: return sizeof(ovs_be16);
+     case OVS_ACTION_ATTR_RECIRC: return sizeof(uint32_t);
+@@ -152,7 +150,6 @@ ovs_key_attr_to_string(enum ovs_key_attr attr, char *namebuf, size_t bufsize)
+     case OVS_KEY_ATTR_CT_LABELS: return "ct_label";
+     case OVS_KEY_ATTR_TUNNEL: return "tunnel";
+     case OVS_KEY_ATTR_IN_PORT: return "in_port";
+-    case OVS_KEY_ATTR_ENCAP_ETH: return "encap_eth";
+     case OVS_KEY_ATTR_NSH: return "nsh";
+     case OVS_KEY_ATTR_ETHERNET: return "eth";
+     case OVS_KEY_ATTR_VLAN: return "vlan";
+@@ -382,31 +379,26 @@ format_vlan_tci(struct ds *ds, ovs_be16 tci, ovs_be16 mask, bool verbose)
+ static void
+ format_nsh(struct ds *ds, const struct ovs_action_push_nsh * nsh)
+ {
+-    const struct nsh_hdr *nsh_hdr =(struct nsh_hdr *)nsh->header;
++    const struct eth_nsh_hdr *eth_nsh_header = (struct eth_nsh_hdr *)nsh->header;
++    format_eth(ds, "encap_eth_src",
++                    eth_nsh_header->encap_eth_header.encap_eth_src,
++                    NULL, true);
++    format_eth(ds, "encap_eth_dst", 
++                    eth_nsh_header->encap_eth_header.encap_eth_dst,
++                    NULL, true);
++    ds_put_format(ds, "encap_eth_type=0x%04"PRIx16",",
++                  ntohs(eth_nsh_header->encap_eth_header.encap_eth_type));
+     ds_put_format(ds, "nsh_mdtype=%"PRIu8",nsh_np=%"PRIu8",nsp=%"PRIu32
+ 		  ",nsi=%"PRIu8",nshc1=%"PRIu32",nshc2=%"PRIu32
+ 		  ",nshc3=%"PRIu32",nshc4=%"PRIu32")",
+-                  nsh_hdr->base.mdtype,
+-                  nsh_hdr->base.proto,
+-                  ntohl(nsh_hdr->base.path_hdr << 8),
+-                  ntohl(nsh_hdr->base.path_hdr >> 24),
+-                  ntohl(nsh_hdr->ctx.nshc1),
+-                  ntohl(nsh_hdr->ctx.nshc2),
+-                  ntohl(nsh_hdr->ctx.nshc3),
+-                  ntohl(nsh_hdr->ctx.nshc4));
+-}
+-
+-static void
+-format_encap_eth(struct ds *ds, const struct ovs_action_push_eth *encap_eth)
+-{
+-    const struct encap_eth_hdr *encap_eth_hdr = (struct encap_eth_hdr *)encap_eth->header;
+-    ds_put_format(ds, "encap_eth_type=%"PRIu16",",
+-                  ntohs(encap_eth_hdr->encap_eth_type));
+-    format_eth(ds, "encap_eth_src", encap_eth_hdr->encap_eth_src,
+-               NULL, true);
+-    format_eth(ds, "encap_eth_dst", encap_eth_hdr->encap_eth_dst,
+-               NULL, true);
+-    ds_put_format(ds, ")");
++                  eth_nsh_header->nsh_hdr.base.mdtype,
++                  eth_nsh_header->nsh_hdr.base.proto,
++                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr << 8),
++                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr >> 24),
++                  ntohl(eth_nsh_header->nsh_hdr.ctx.nshc1),
++                  ntohl(eth_nsh_header->nsh_hdr.ctx.nshc2),
++                  ntohl(eth_nsh_header->nsh_hdr.ctx.nshc3),
++                  ntohl(eth_nsh_header->nsh_hdr.ctx.nshc4));
+ }
+ 
+ static void
+@@ -798,7 +790,6 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
+     int expected_len;
+     enum ovs_action_attr type = nl_attr_type(a);
+     const struct ovs_action_push_nsh *nsh;
+-    const struct ovs_action_push_eth *encap_eth;
+     size_t size;
+ 
+     expected_len = odp_action_len(nl_attr_type(a));
+@@ -877,15 +868,6 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
+     case OVS_ACTION_ATTR_POP_NSH:
+         ds_put_cstr(ds, "pop_nsh");
+         break;
+-
+-    case OVS_ACTION_ATTR_PUSH_ETH:
+-        encap_eth = nl_attr_get(a);
+-        ds_put_cstr(ds, "push_eth(");
+-        format_encap_eth(ds, encap_eth);
+-        break;
+-    case OVS_ACTION_ATTR_POP_ETH:
+-        ds_put_cstr(ds, "pop_eth");
+-        break;
+     case OVS_ACTION_ATTR_PUSH_MPLS: {
+         const struct ovs_action_push_mpls *mpls = nl_attr_get(a);
+         ds_put_cstr(ds, "push_mpls(");
+@@ -1675,29 +1657,37 @@ parse_odp_action(const char *s, const struct simap *port_names,
+ 
+     {
+         struct ovs_action_push_nsh push;
+-        struct nsh_hdr *nsh = (struct nsh_hdr *)push.header;
++        struct eth_nsh_hdr *eth_nsh_header = (struct eth_nsh_hdr *)push.header;
+         ovs_be32 nsp, nshc1,nshc2,nshc3,nshc4;
+         uint8_t nsi, nsh_mdtype, nsh_np;
+         int n = -1;
+ 
+-        if (ovs_scan_len(s, &n, "push_nsh(nsh_mdtype=%"SCNi8",nsh_np=%"SCNi8",nsp=0x%"SCNx32
++        if (ovs_scan_len(s, &n, "push_nsh(encap_eth_dst="ETH_ADDR_SCAN_FMT
++                        ",encap_eth_src="ETH_ADDR_SCAN_FMT
++                        ",encap_eth_type=0x%"SCNx16
++                        ",nsh_mdtype=%"SCNi8",nsh_np=%"SCNi8",nsp=0x%"SCNx32
+                         ",nsi=%"SCNi8",nshc1=0x%"SCNx32",nshc2=0x%"SCNx32
+                         ",nshc3=0x%"SCNx32",nshc4=0x%"SCNx32"))",
++                        ETH_ADDR_SCAN_ARGS(eth_nsh_header->encap_eth_header.encap_eth_dst),
++                        ETH_ADDR_SCAN_ARGS(eth_nsh_header->encap_eth_header.encap_eth_src),
++                        &eth_nsh_header->encap_eth_header.encap_eth_type,
+                         &nsh_mdtype, &nsh_np,
+                         &nsp, &nsi,
+                         &nshc1, &nshc2,
+                         &nshc3, &nshc4)) {
++            eth_nsh_header->encap_eth_header.encap_eth_type = htons(eth_nsh_header->encap_eth_header.encap_eth_type); 
+             if (nsh_mdtype == NSH_M_TYPE1) {
+-                nsh->base.mdtype = NSH_M_TYPE1;
+-                nsh->base.version = 0x01;
+-                nsh->base.length = 6;
+-                nsh->base.proto = nsh_np;
+-                nsh->base.path_hdr= nsp;
+-                nsh->base.svc_idx = nsi;
+-                nsh->ctx.nshc1=nshc1;
+-                nsh->ctx.nshc2=nshc2;
+-                nsh->ctx.nshc3=nshc3;
+-                nsh->ctx.nshc4=nshc4;
++                eth_nsh_header->encap_eth_header.encap_eth_type = htons(ETH_P_NSH);
++                eth_nsh_header->nsh_hdr.base.mdtype = NSH_M_TYPE1;
++                eth_nsh_header->nsh_hdr.base.version = 0x01;
++                eth_nsh_header->nsh_hdr.base.length = 6;
++                eth_nsh_header->nsh_hdr.base.proto = nsh_np;
++                eth_nsh_header->nsh_hdr.base.path_hdr= nsp;
++                eth_nsh_header->nsh_hdr.base.svc_idx = nsi;
++                eth_nsh_header->nsh_hdr.ctx.nshc1=nshc1;
++                eth_nsh_header->nsh_hdr.ctx.nshc2=nshc2;
++                eth_nsh_header->nsh_hdr.ctx.nshc3=nshc3;
++                eth_nsh_header->nsh_hdr.ctx.nshc4=nshc4;
+                 push.nsh_mdtype = NSH_M_TYPE1;
+                 nl_msg_put_unspec(actions, OVS_ACTION_ATTR_PUSH_NSH,
+                               &push, sizeof push);
+@@ -1713,33 +1703,6 @@ parse_odp_action(const char *s, const struct simap *port_names,
+     }
+ 
+     {
+-        struct ovs_action_push_eth push;
+-        struct encap_eth_hdr *encap_eth = (struct encap_eth_hdr *)push.header;
+-        uint16_t encap_eth_type;
+-        int n = -1;
+-
+-        if (ovs_scan_len(s, &n, "push_eth(encap_eth_type=0x%"SCNx16",encap_eth_dst="ETH_ADDR_SCAN_FMT",encap_eth_src="ETH_ADDR_SCAN_FMT")",
+-                         &encap_eth_type,
+-                         ETH_ADDR_SCAN_ARGS(encap_eth->encap_eth_dst),
+-                         ETH_ADDR_SCAN_ARGS(encap_eth->encap_eth_src))) {
+-            if (encap_eth->encap_eth_type == ETH_P_NSH) {
+-                push.encap_eth_type = ETH_P_NSH;
+-                encap_eth->encap_eth_type = htons(ETH_P_NSH);
+-                nl_msg_put_unspec(actions, OVS_ACTION_ATTR_PUSH_ETH,
+-                              &push, sizeof push);
+-            }
+-
+-            return n;
+-        }
+-
+-    }
+-
+-    if (!strncmp(s, "pop_eth", 7)) {
+-        nl_msg_put_flag(actions, OVS_ACTION_ATTR_POP_ETH);
+-        return 7;
+-    }
+-
+-    {
+         double percentage;
+         int n = -1;
+ 
+@@ -1881,8 +1844,7 @@ static const struct attr_len_tbl ovs_flow_key_attr_lens[OVS_KEY_ATTR_MAX + 1] =
+                                  .next = ovs_tun_key_attr_lens,
+                                  .next_max = OVS_TUNNEL_KEY_ATTR_MAX },
+     [OVS_KEY_ATTR_IN_PORT]   = { .len = 4  },
+-    [OVS_KEY_ATTR_ENCAP_ETH] = { .len = 14  },
+-    [OVS_KEY_ATTR_NSH]       = { .len = 24  },
++    [OVS_KEY_ATTR_NSH]       = { .len = sizeof(struct ovs_key_nsh)  },
+     [OVS_KEY_ATTR_ETHERNET]  = { .len = sizeof(struct ovs_key_ethernet) },
+     [OVS_KEY_ATTR_VLAN]      = { .len = 2 },
+     [OVS_KEY_ATTR_ETHERTYPE] = { .len = 2 },
+@@ -2943,6 +2905,9 @@ format_odp_key_attr(const struct nlattr *a, const struct nlattr *ma,
+         const struct ovs_key_nsh *mask = ma ? nl_attr_get(ma) : NULL;
+         const struct ovs_key_nsh *key = nl_attr_get(a);
+ 
++        format_eth(ds, "encap_eth_src", key->encap_eth_src, MASK(mask, encap_eth_src), verbose);
++        format_eth(ds, "encap_eth_dst", key->encap_eth_dst, MASK(mask, encap_eth_dst), verbose);
++        format_be16x(ds, "encap_eth_type", key->encap_eth_type, MASK(mask, encap_eth_type), verbose);
+         format_u8u(ds, "nsi", key->nsi, MASK(mask, nsi), verbose);
+         format_be32(ds, "nsp", key->nsp, MASK(mask, nsp), verbose);
+         format_u8u(ds, "nsh_mdtype", key->nsh_mdtype, MASK(mask, nsh_mdtype), verbose);
+@@ -2955,18 +2920,6 @@ format_odp_key_attr(const struct nlattr *a, const struct nlattr *ma,
+         break;
+     }
+ 
+-    case OVS_KEY_ATTR_ENCAP_ETH: {
+-        const struct ovs_key_encap_eth *mask = ma ? nl_attr_get(ma) : NULL;
+-        const struct ovs_key_encap_eth *key = nl_attr_get(a);
+-
+-        format_be16(ds, "encap_eth_type", key->encap_eth_type, MASK(mask, encap_eth_type), verbose);
+-        format_eth(ds, "encap_eth_src", key->encap_eth_src, MASK(mask, encap_eth_src), verbose);
+-        format_eth(ds, "encap_eth_dst", key->encap_eth_dst, MASK(mask, encap_eth_dst), verbose);
+-        ds_chomp(ds, ',');
+-
+-        break;
+-    }
+-
+     case OVS_KEY_ATTR_ETHERNET: {
+         const struct ovs_key_ethernet *mask = ma ? nl_attr_get(ma) : NULL;
+         const struct ovs_key_ethernet *key = nl_attr_get(a);
+@@ -3374,27 +3327,6 @@ scan_nsp(const char *s, uint32_t *key, uint32_t *mask)
+ }
+ 
+ static int
+-scan_encap_eth_type(const char *s, uint16_t *key, uint16_t *mask)
+-{
+-    int n;
+-
+-    if (ovs_scan(s, "%"SCNi16"%n", key, &n)) {
+-        int len = n;
+-        *key = htons(*key);
+-        if (mask) {
+-            if (ovs_scan(s + len, "/%"SCNi16"%n", mask, &n)) {
+-                len += n;
+-                *mask = htons(*mask);
+-            } else {
+-                *mask = UINT16_MAX;
+-            }
+-        }
+-        return len;
+-    }
+-    return 0;
+-}
+-
+-static int
+ scan_ipv4(const char *s, ovs_be32 *key, ovs_be32 *mask)
+ {
+     int n;
+@@ -4335,6 +4267,9 @@ parse_odp_key_mask_attr(const char *s, const struct simap *port_names,
+     } SCAN_END_NESTED();
+ 
+     SCAN_BEGIN("nsh(", struct ovs_key_nsh) {
++        SCAN_FIELD("encap_eth_dst=", eth, encap_eth_dst);
++        SCAN_FIELD("encap_eth_src=", eth, encap_eth_src);
++        SCAN_FIELD("encap_eth_type=", be16, encap_eth_type);
+         SCAN_FIELD("nsh_mdtype=", u8, nsh_mdtype);
+         SCAN_FIELD("nsh_np=", u8, nsh_np);
+         SCAN_FIELD("nsp=", nsp, nsp);
+@@ -4345,12 +4280,6 @@ parse_odp_key_mask_attr(const char *s, const struct simap *port_names,
+         SCAN_FIELD("nshc4=", u32, nshc4);
+     } SCAN_END(OVS_KEY_ATTR_NSH);
+ 
+-    SCAN_BEGIN("encap_eth(", struct ovs_key_encap_eth) {
+-        SCAN_FIELD("encap_eth_src=", eth, encap_eth_src);
+-        SCAN_FIELD("encap_eth_dst=", eth, encap_eth_dst);
+-        SCAN_FIELD("encap_eth_type=", encap_eth_type, encap_eth_type);
+-    } SCAN_END(OVS_KEY_ATTR_ENCAP_ETH);
+-
+     SCAN_SINGLE_PORT("in_port(", uint32_t, OVS_KEY_ATTR_IN_PORT);
+ 
+     SCAN_BEGIN("eth(", struct ovs_key_ethernet) {
+@@ -4560,19 +4489,15 @@ get_nsh_key(const struct flow *flow, struct ovs_key_nsh *nsh)
+     nsh->nsp = flow->nsp;
+     nsh->nsh_mdtype = flow->nsh_mdtype;
+     nsh->nsh_np = flow->nsh_np;
+-    nsh->reserved = 0;
+     nsh->nshc1 = flow->nshc1;
+     nsh->nshc2 = flow->nshc2;
+     nsh->nshc3 = flow->nshc3;
+     nsh->nshc4 = flow->nshc4;
+-}
+-
+-void
+-get_encap_eth_key(const struct flow *flow, struct ovs_key_encap_eth *encap_eth)
+-{
+-    encap_eth->encap_eth_type = flow->encap_eth_type;
+-    encap_eth->encap_eth_src = flow->encap_eth_src;
+-    encap_eth->encap_eth_dst = flow->encap_eth_dst;
++    nsh->pad2 = 0;
++    nsh->encap_eth_src = flow->encap_eth_src;
++    nsh->encap_eth_dst = flow->encap_eth_dst;
++    nsh->encap_eth_type = flow->encap_eth_type;
++    nsh->pad1 = 0;
+ }
+ 
+ static void
+@@ -4581,7 +4506,6 @@ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
+ {
+     struct ovs_key_ethernet *eth_key;
+     struct ovs_key_nsh *nsh_key;
+-    struct ovs_key_encap_eth *encap_eth_key;
+     size_t encap;
+     const struct flow *flow = parms->flow;
+     const struct flow *data = export_mask ? parms->mask : parms->flow;
+@@ -4626,12 +4550,6 @@ odp_flow_key_from_flow__(const struct odp_flow_key_parms *parms,
+         get_nsh_key(data, nsh_key);
+     }
+ 
+-    if (flow->encap_eth_type) {
+-        encap_eth_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_ENCAP_ETH,
+-                                           sizeof *encap_eth_key);
+-        get_encap_eth_key(data, encap_eth_key);
+-    }
+-
+     eth_key = nl_msg_put_unspec_uninit(buf, OVS_KEY_ATTR_ETHERNET,
+                                        sizeof *eth_key);
+     get_ethernet_key(data, eth_key);
+@@ -5500,17 +5418,6 @@ odp_flow_key_to_flow__(const struct nlattr *key, size_t key_len,
+         }
+     }
+ 
+-    /* ENCAP Eth header. */
+-    if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_ENCAP_ETH)) {
+-        const struct ovs_key_encap_eth *encap_eth_key;
+-
+-        encap_eth_key = nl_attr_get(attrs[OVS_KEY_ATTR_ENCAP_ETH]);
+-        put_encap_eth_key(encap_eth_key, flow);
+-        if (is_mask) {
+-            expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_ENCAP_ETH;
+-        }
+-    }
+-
+     /* Ethernet header. */
+     if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_ETHERNET)) {
+         const struct ovs_key_ethernet *eth_key;
+@@ -5823,28 +5730,16 @@ put_nsh_key(const struct ovs_key_nsh *nsh, struct flow *flow)
+     flow->nshc2 = nsh->nshc2;
+     flow->nshc3 = nsh->nshc3;
+     flow->nshc4 = nsh->nshc4;
++    flow->encap_eth_src = nsh->encap_eth_src;
++    flow->encap_eth_dst = nsh->encap_eth_dst;
++    flow->encap_eth_type = nsh->encap_eth_type;
+ }
+ 
+ void
+ flow_zero_nsh(struct flow *flow)
+ {
+-    void *dst_p = &(flow->nshc1);
+-    memset(dst_p, 0, 24);
+-}
+-
+-void
+-flow_zero_encap_eth(struct flow *flow)
+-{
+-    void *dst_p = &flow->encap_eth_src;
+-    memset(dst_p, 0, 16);
+-}
+-
+-void
+-put_encap_eth_key(const struct ovs_key_encap_eth *encap_eth, struct flow *flow)
+-{
+-    flow->encap_eth_type = encap_eth->encap_eth_type;
+-    flow->encap_eth_src = encap_eth->encap_eth_src;
+-    flow->encap_eth_dst = encap_eth->encap_eth_dst;
++     void *dst_p = &(flow->encap_eth_dst);
++     memset(dst_p, 0, 40);
+ }
+ 
+ static void
+@@ -5899,45 +5794,45 @@ commit_vlan_action(ovs_be16 vlan_tci, struct flow *base,
+ }
+ 
+ static void
+-commit_nsh_pop_action(const struct flow *flow, struct flow *base,
+-                   struct ofpbuf *odp_actions, struct flow_wildcards *wc)
++commit_nsh_pop_action(const struct ovs_key_nsh *flow_key,
++                    const struct ovs_key_nsh *base_key,
++                    struct ofpbuf *odp_actions, struct flow_wildcards *wc)
+ {
+-    struct ovs_key_nsh flow_key, base_key;
+-    get_nsh_key(flow, &flow_key);
+-    get_nsh_key(base, &base_key);
+ 
+-    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
++    if (memcmp(flow_key, base_key, sizeof (struct ovs_key_nsh))) {
+         memset(&wc->masks.nsh_mdtype, 0xff, sizeof wc->masks.nsh_mdtype);
+ 
+-        if (base->nsh_mdtype) {
++        if (base_key->nsh_mdtype) {
+             nl_msg_put_flag(odp_actions, OVS_ACTION_ATTR_POP_NSH);
+         }
+     }
+ }
+ 
+ static void
+-commit_nsh_push_action(const struct flow *flow, struct flow *base,
+-                   struct ofpbuf *odp_actions)
++commit_nsh_push_action(const struct ovs_key_nsh *flow_key,
++                    const struct ovs_key_nsh *base_key,
++                    struct ofpbuf *odp_actions)
+ {
+-    struct ovs_key_nsh flow_key, base_key;
+-    get_nsh_key(flow, &flow_key);
+-    get_nsh_key(base, &base_key);
+-
+-    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
+-        if (flow->nsh_mdtype) {
++    if (memcmp(flow_key, base_key, sizeof (struct ovs_key_nsh))) {
++        if (flow_key->nsh_mdtype) {
+             struct ovs_action_push_nsh nsh;
+-            nsh.nsh_mdtype = flow->nsh_mdtype;
+-            struct nsh_hdr *nsh_hdr = (struct nsh_hdr *)nsh.header;
+-            memset(nsh_hdr, 0, sizeof *nsh_hdr);
+-            nsh_hdr->base.length = 6;
+-            nsh_hdr->base.proto = flow->nsh_np;
+-            nsh_hdr->base.mdtype = flow->nsh_mdtype;
+-            nsh_hdr->base.proto = flow->nsh_np;
+-            nsh_hdr->base.path_hdr = flow->nsp >> 8 | flow->nsi << 24;
+-            nsh_hdr->ctx.nshc1 = flow->nshc1;
+-            nsh_hdr->ctx.nshc2 = flow->nshc2;
+-            nsh_hdr->ctx.nshc3 = flow->nshc3;
+-            nsh_hdr->ctx.nshc4 = flow->nshc4;
++            nsh.nsh_mdtype = flow_key->nsh_mdtype;
++            struct eth_nsh_hdr *eth_nsh_header = (struct eth_nsh_hdr *)nsh.header;
++            memset(eth_nsh_header, 0, sizeof *eth_nsh_header);
++            eth_nsh_header->nsh_hdr.base.length = 6;
++            eth_nsh_header->nsh_hdr.base.proto = flow_key->nsh_np;
++            eth_nsh_header->nsh_hdr.base.mdtype = flow_key->nsh_mdtype;
++            eth_nsh_header->nsh_hdr.base.proto = flow_key->nsh_np;
++            eth_nsh_header->nsh_hdr.base.path_hdr = flow_key->nsp >> 8 | flow_key->nsi << 24;
++            eth_nsh_header->nsh_hdr.ctx.nshc1 = flow_key->nshc1;
++            eth_nsh_header->nsh_hdr.ctx.nshc2 = flow_key->nshc2;
++            eth_nsh_header->nsh_hdr.ctx.nshc3 = flow_key->nshc3;
++            eth_nsh_header->nsh_hdr.ctx.nshc4 = flow_key->nshc4;
++
++            eth_nsh_header->encap_eth_header.encap_eth_type = htons(ETH_P_NSH);
++            eth_nsh_header->encap_eth_header.encap_eth_dst = flow_key->encap_eth_dst;
++            eth_nsh_header->encap_eth_header.encap_eth_src = flow_key->encap_eth_src;
++
+             nl_msg_put_unspec(odp_actions, OVS_ACTION_ATTR_PUSH_NSH,
+                               &nsh, sizeof nsh);
+         }
+@@ -5945,46 +5840,16 @@ commit_nsh_push_action(const struct flow *flow, struct flow *base,
+ }
+ 
+ static void
+-commit_encap_eth_pop_action(const struct flow *flow, struct flow *base,
++commit_nsh_action(const struct flow *flow, struct flow *base,
+                    struct ofpbuf *odp_actions, struct flow_wildcards *wc)
+ {
+-    struct ovs_key_encap_eth flow_key, base_key;
+-    get_encap_eth_key(flow, &flow_key);
+-    get_encap_eth_key(base, &base_key);
+-
+-    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
+-        memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
+-
+-        if (base->encap_eth_type) {
+-            nl_msg_put_flag(odp_actions, OVS_ACTION_ATTR_POP_ETH);
+-        }
+-    }
++    struct ovs_key_nsh flow_key, base_key;
++    get_nsh_key(flow, &flow_key);
++    get_nsh_key(base, &base_key);
++    commit_nsh_pop_action(&flow_key, &base_key, odp_actions, wc);
++    commit_nsh_push_action(&flow_key, &base_key, odp_actions);
+ }
+ 
+-static void
+-commit_encap_eth_push_action(const struct flow *flow, struct flow *base,
+-                   struct ofpbuf *odp_actions)
+-{
+-    struct ovs_key_encap_eth flow_key, base_key;
+-    get_encap_eth_key(flow, &flow_key);
+-    get_encap_eth_key(base, &base_key);
+-
+-    if (memcmp(&flow_key, &base_key, sizeof flow_key)) {
+-        if (flow->encap_eth_type) {
+-            struct ovs_action_push_eth encap_eth;
+-            encap_eth.encap_eth_type = flow->encap_eth_type;
+-            struct encap_eth_hdr *encap_eth_header =
+-                       (struct encap_eth_hdr *)encap_eth.header;
+-            void *dst_p = encap_eth_header->encap_eth_dst.ea;
+-            void *src_p = encap_eth_header->encap_eth_src.ea;
+-            memcpy(dst_p, flow->encap_eth_dst.ea, sizeof flow->encap_eth_dst);
+-            memcpy(src_p, flow->encap_eth_src.ea, sizeof flow->encap_eth_src);
+-            encap_eth_header->encap_eth_type = htons(ETH_P_NSH);
+-            nl_msg_put_unspec(odp_actions, OVS_ACTION_ATTR_PUSH_ETH,
+-                              &encap_eth, sizeof encap_eth);
+-        }
+-    }
+-}
+ 
+ /* Wildcarding already done at action translation time. */
+ static void
+@@ -6417,10 +6282,7 @@ commit_odp_actions(const struct flow *flow, struct flow *base,
+     slow2 = commit_set_icmp_action(flow, base, odp_actions, wc);
+     commit_mpls_action(flow, base, odp_actions);
+     commit_vlan_action(flow->vlan_tci, base, odp_actions, wc);
+-    commit_encap_eth_pop_action(flow, base, odp_actions, wc);
+-    commit_nsh_pop_action(flow, base, odp_actions, wc);
+-    commit_nsh_push_action(flow, base, odp_actions);
+-    commit_encap_eth_push_action(flow, base, odp_actions);
++    commit_nsh_action(flow, base, odp_actions, wc);
+     commit_set_priority_action(flow, base, odp_actions, wc, use_masked);
+     commit_set_pkt_mark_action(flow, base, odp_actions, wc, use_masked);
+ 
+diff --git a/lib/odp-util.h b/lib/odp-util.h
+index 2cb04f1..26e036f 100644
+--- a/lib/odp-util.h
++++ b/lib/odp-util.h
+@@ -126,8 +126,7 @@ void odp_portno_names_destroy(struct hmap *portno_names);
+  *  OVS_KEY_ATTR_CT_ZONE                 2     2     4      8
+  *  OVS_KEY_ATTR_CT_MARK                 4    --     4      8
+  *  OVS_KEY_ATTR_CT_LABEL               16    --     4     20
+- *  OVS_KEY_ATTR_NSH                    24    --     4     28
+- *  OVS_KEY_ATTR_ENCAP                  14    --     4     18
++ *  OVS_KEY_ATTR_NSH                    40    --     4     44
+  *  OVS_KEY_ATTR_ETHERNET               12    --     4     16
+  *  OVS_KEY_ATTR_ETHERTYPE               2     2     4      8  (outer VLAN ethertype)
+  *  OVS_KEY_ATTR_VLAN                    2     2     4      8
+@@ -154,10 +153,7 @@ struct odputil_keybuf {
+ 
+ void put_nsh_key(const struct ovs_key_nsh *, struct flow *);
+ void get_nsh_key(const struct flow *flow, struct ovs_key_nsh *nsh);
+-void put_encap_eth_key(const struct ovs_key_encap_eth *encap_eth, struct flow *flow);
+-void get_encap_eth_key(const struct flow *flow, struct ovs_key_encap_eth *encap_eth);
+ void flow_zero_nsh(struct flow *);
+-void flow_zero_encap_eth(struct flow *);
+ enum odp_key_fitness odp_tun_key_from_attr(const struct nlattr *, bool udpif,
+                                            struct flow_tnl *);
+ 
+diff --git a/lib/ofp-actions.c b/lib/ofp-actions.c
+index f4062b2..8cce6c9 100644
+--- a/lib/ofp-actions.c
++++ b/lib/ofp-actions.c
+@@ -305,12 +305,6 @@ enum ofp_raw_action_type {
+     /* NX1.0+(39): void. */
+     NXAST_RAW_POP_NSH,
+ 
+-    /* NX1.0+(40): void. */
+-    NXAST_RAW_PUSH_ETH,
+-
+-    /* NX1.0+(41): void. */
+-    NXAST_RAW_POP_ETH,
+-
+ /* ## ------------------ ## */
+ /* ## Debugging actions. ## */
+ /* ## ------------------ ## */
+@@ -397,6 +391,8 @@ ofpact_next_flattened(const struct ofpact *ofpact)
+     case OFPACT_SET_VLAN_PCP:
+     case OFPACT_STRIP_VLAN:
+     case OFPACT_PUSH_VLAN:
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+     case OFPACT_SET_IPV4_SRC:
+@@ -1697,66 +1693,6 @@ format_POP_NSH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
+     ds_put_format(s, "pop_nsh");
+ }
+ 
+-/* Push ENCAP Eth header actions. */
+-static enum ofperr
+-decode_NXAST_RAW_PUSH_ETH(struct ofpbuf * out)
+-{
+-    ofpact_put_PUSH_ETH(out)->ofpact.raw = NXAST_RAW_PUSH_ETH;
+-
+-    return 0;
+-}
+-
+-static void
+-encode_PUSH_ETH(const struct ofpact_null *null OVS_UNUSED,
+-                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
+-{
+-    put_NXAST_PUSH_ETH(out);
+-}
+-
+-static char * OVS_WARN_UNUSED_RESULT
+-parse_PUSH_ETH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
+-                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
+-{
+-    ofpact_put_PUSH_ETH(ofpacts)->ofpact.raw = NXAST_RAW_PUSH_ETH;;
+-    return NULL;
+-}
+-
+-static void
+-format_PUSH_ETH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
+-{
+-    ds_put_format(s, "push_eth");
+-}
+-
+-/* Pop ENCAP ETH header actions. */
+-static enum ofperr
+-decode_NXAST_RAW_POP_ETH(struct ofpbuf * out)
+-{
+-    ofpact_put_POP_ETH(out)->ofpact.raw = NXAST_RAW_POP_ETH;
+-
+-    return 0;
+-}
+-
+-static void
+-encode_POP_ETH(const struct ofpact_null *null OVS_UNUSED,
+-                  enum ofp_version ofp_version OVS_UNUSED, struct ofpbuf *out)
+-{
+-    put_NXAST_POP_ETH(out);
+-}
+-
+-static char * OVS_WARN_UNUSED_RESULT
+-parse_POP_ETH(char *arg OVS_UNUSED, struct ofpbuf *ofpacts,
+-                 enum ofputil_protocol *usable_protocols OVS_UNUSED)
+-{
+-    ofpact_put_POP_ETH(ofpacts)->ofpact.raw = NXAST_RAW_POP_ETH;
+-    return NULL;
+-}
+-
+-static void
+-format_POP_ETH(const struct ofpact_null *a OVS_UNUSED, struct ds *s)
+-{
+-    ds_put_format(s, "pop_eth");
+-}
+-
+ /* Action structure for OFPAT10_SET_DL_SRC/DST and OFPAT11_SET_DL_SRC/DST. */
+ struct ofp_action_dl_addr {
+     ovs_be16 type;                  /* Type. */
+@@ -6044,8 +5980,6 @@ ofpact_is_set_or_move_action(const struct ofpact *a)
+     case OFPACT_PUSH_VLAN:
+     case OFPACT_PUSH_NSH:
+     case OFPACT_POP_NSH:
+-    case OFPACT_PUSH_ETH:
+-    case OFPACT_POP_ETH:
+     case OFPACT_RESUBMIT:
+     case OFPACT_SAMPLE:
+     case OFPACT_STACK_POP:
+@@ -6075,8 +6009,6 @@ ofpact_is_allowed_in_actions_set(const struct ofpact *a)
+     case OFPACT_PUSH_VLAN:
+     case OFPACT_PUSH_NSH:
+     case OFPACT_POP_NSH:
+-    case OFPACT_PUSH_ETH:
+-    case OFPACT_POP_ETH:
+     case OFPACT_REG_MOVE:
+     case OFPACT_SET_FIELD:
+     case OFPACT_SET_ETH_DST:
+@@ -6304,8 +6236,6 @@ ovs_instruction_type_from_ofpact_type(enum ofpact_type type)
+     case OFPACT_PUSH_VLAN:
+     case OFPACT_PUSH_NSH:
+     case OFPACT_POP_NSH:
+-    case OFPACT_PUSH_ETH:
+-    case OFPACT_POP_ETH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+     case OFPACT_SET_IPV4_SRC:
+@@ -6775,6 +6705,8 @@ ofpact_check__(enum ofputil_protocol *usable_protocols, struct ofpact *a,
+         flow->vlan_tci |= htons(VLAN_CFI);
+         return 0;
+ 
++    case OFPACT_PUSH_NSH:
++    case OFPACT_POP_NSH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+         return 0;
+@@ -6853,10 +6785,6 @@ ofpact_check__(enum ofputil_protocol *usable_protocols, struct ofpact *a,
+     case OFPACT_SET_TUNNEL:
+     case OFPACT_SET_QUEUE:
+     case OFPACT_POP_QUEUE:
+-    case OFPACT_PUSH_NSH:
+-    case OFPACT_POP_NSH:
+-    case OFPACT_PUSH_ETH:
+-    case OFPACT_POP_ETH:
+     case OFPACT_RESUBMIT:
+         return 0;
+ 
+@@ -7416,8 +7344,6 @@ ofpact_outputs_to_port(const struct ofpact *ofpact, ofp_port_t port)
+     case OFPACT_PUSH_VLAN:
+     case OFPACT_PUSH_NSH:
+     case OFPACT_POP_NSH:
+-    case OFPACT_PUSH_ETH:
+-    case OFPACT_POP_ETH:
+     case OFPACT_SET_ETH_SRC:
+     case OFPACT_SET_ETH_DST:
+     case OFPACT_SET_IPV4_SRC:
+diff --git a/lib/ofp-actions.h b/lib/ofp-actions.h
+index 3897c0b..e212f87 100644
+--- a/lib/ofp-actions.h
++++ b/lib/ofp-actions.h
+@@ -96,8 +96,6 @@
+     /* NSH */                                                           \
+     OFPACT(PUSH_NSH,        ofpact_null,        ofpact, "push_nsh")     \
+     OFPACT(POP_NSH,         ofpact_null,        ofpact, "pop_nsh")      \
+-    OFPACT(PUSH_ETH,        ofpact_null,        ofpact, "push_eth")   	\
+-    OFPACT(POP_ETH,         ofpact_null,        ofpact, "pop_eth")   	\
+ 																		\
+     /* Flow table interaction. */                                       \
+     OFPACT(RESUBMIT,        ofpact_resubmit,    ofpact, "resubmit")     \
+diff --git a/lib/packets.c b/lib/packets.c
+index d0c0e68..d314b2d 100644
+--- a/lib/packets.c
++++ b/lib/packets.c
+@@ -242,6 +242,29 @@ set_ethertype(struct dp_packet *packet, ovs_be16 eth_type)
+     }
+ }
+ 
++void
++push_nsh(struct dp_packet *packet, const void *nsh)
++{
++    void *header;
++    const struct ovs_action_push_nsh *push_nsh_hdr = (const struct ovs_action_push_nsh *)nsh;
++    const uint8_t *pdata = push_nsh_hdr->header; 
++    /* Now only support MD type1 */
++    if (push_nsh_hdr->nsh_mdtype != NSH_M_TYPE1)
++        return; 
++    header = dp_packet_push_uninit(packet, ETH_NSH_TYPE1_HEADER_SIZE);
++
++    memcpy(header, pdata, ETH_NSH_TYPE1_HEADER_SIZE);
++}
++
++void
++pop_nsh(struct dp_packet *packet)
++{
++    if (ETH_NSH_TYPE1_HEADER_SIZE > dp_packet_size(packet)) {
++       	return;
++    }   
++    dp_packet_reset_packet(packet, ETH_NSH_TYPE1_HEADER_SIZE);
++}
++
+ static bool is_mpls(struct dp_packet *packet)
+ {
+     return packet->l2_5_ofs != UINT16_MAX;
+diff --git a/lib/packets.h b/lib/packets.h
+index dc97333..057efab 100644
+--- a/lib/packets.h
++++ b/lib/packets.h
+@@ -313,6 +313,9 @@ void compose_rarp(struct dp_packet *, const struct eth_addr);
+ void eth_push_vlan(struct dp_packet *, ovs_be16 tpid, ovs_be16 tci);
+ void eth_pop_vlan(struct dp_packet *);
+ 
++void push_nsh(struct dp_packet *packet, const void *nsh);
++void pop_nsh(struct dp_packet *packet);
++
+ const char *eth_from_hex(const char *hex, struct dp_packet **packetp);
+ void eth_format_masked(const struct eth_addr ea,
+                        const struct eth_addr *mask, struct ds *s);
+diff --git a/ofproto/ofproto-dpif-sflow.c b/ofproto/ofproto-dpif-sflow.c
+index e15e8d2..511e20a 100644
+--- a/ofproto/ofproto-dpif-sflow.c
++++ b/ofproto/ofproto-dpif-sflow.c
+@@ -977,7 +977,6 @@ sflow_read_set_action(const struct nlattr *attr,
+     case OVS_KEY_ATTR_ETHERNET:
+     case OVS_KEY_ATTR_VLAN:
+     case OVS_KEY_ATTR_NSH:
+-    case OVS_KEY_ATTR_ENCAP_ETH:
+         break;
+ 
+     case OVS_KEY_ATTR_MPLS: {
+diff --git a/ofproto/ofproto-dpif-upcall.c b/ofproto/ofproto-dpif-upcall.c
+index f59eed8..ec19739 100644
+--- a/ofproto/ofproto-dpif-upcall.c
++++ b/ofproto/ofproto-dpif-upcall.c
+@@ -748,7 +748,6 @@ recv_upcalls(struct handler *handler)
+         struct flow *flow = &flows[n_upcalls];
+         unsigned int mru;
+         struct ovs_key_nsh reserve_nsh;
+-        struct ovs_key_encap_eth reserve_encap_eth;
+         bool nsh_mdtype_flag, encap_eth_type_flag;
+         int error;
+ 
+@@ -802,21 +801,14 @@ recv_upcalls(struct handler *handler)
+         pkt_metadata_from_flow(&dupcall->packet.md, flow);
+ 
+         nsh_mdtype_flag = !!(flow->nsh_mdtype);
+-        encap_eth_type_flag = !!(flow->encap_eth_type);
+         if(nsh_mdtype_flag)
+             get_nsh_key(flow, &reserve_nsh);
+ 
+-        if(encap_eth_type_flag)
+-            get_encap_eth_key(flow, &reserve_encap_eth);
+-
+         flow_extract(&dupcall->packet, flow);
+ 
+         if(nsh_mdtype_flag)
+             put_nsh_key(&reserve_nsh, flow);
+ 
+-        if(encap_eth_type_flag)
+-            put_encap_eth_key(&reserve_encap_eth, flow);
+-
+         error = process_upcall(udpif, upcall,
+                                &upcall->odp_actions, &upcall->wc);
+         if (error) {
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index 4f91d0a..221c17d 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -4242,8 +4242,6 @@ freeze_unroll_actions(const struct ofpact *a, const struct ofpact *end,
+         case OFPACT_PUSH_VLAN:
+         case OFPACT_PUSH_NSH:
+         case OFPACT_POP_NSH:
+-        case OFPACT_PUSH_ETH:
+-        case OFPACT_POP_ETH:
+         case OFPACT_SET_ETH_SRC:
+         case OFPACT_SET_ETH_DST:
+         case OFPACT_SET_IPV4_SRC:
+@@ -4530,6 +4528,8 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
+ 
+         case OFPACT_PUSH_NSH:
+             memset(&wc->masks.nsh_mdtype, 0xff, sizeof wc->masks.nsh_mdtype);
++            flow->encap_eth_dst = flow->dl_dst;
++            flow->encap_eth_src = flow->dl_src;
+             break;
+ 
+         case OFPACT_POP_NSH:
+@@ -4537,15 +4537,6 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
+             flow_zero_nsh(flow);
+             break;
+ 
+-        case OFPACT_PUSH_ETH:
+-            memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
+-            break;
+-
+-        case OFPACT_POP_ETH:
+-            memset(&wc->masks.encap_eth_type, 0xff, sizeof wc->masks.encap_eth_type);
+-            flow_zero_encap_eth(flow);
+-            break;
+-
+         case OFPACT_STRIP_VLAN:
+             memset(&wc->masks.vlan_tci, 0xff, sizeof wc->masks.vlan_tci);
+             flow->vlan_tci = htons(0);
+diff --git a/ofproto/ofproto-dpif.h b/ofproto/ofproto-dpif.h
+index 0064178..aee8ff5 100644
+--- a/ofproto/ofproto-dpif.h
++++ b/ofproto/ofproto-dpif.h
+@@ -93,7 +93,6 @@ struct dpif_backer_support {
+     /* Each member represents support for related OVS_KEY_ATTR_* fields. */
+     struct odp_support odp;
+ };
+-
+ bool ofproto_dpif_get_enable_ufid(const struct dpif_backer *backer);
+ struct dpif_backer_support *ofproto_dpif_get_support(const struct ofproto_dpif *);
+ 
+diff --git a/ofproto/tunnel.c b/ofproto/tunnel.c
+index 7430994..bc92b40 100644
+--- a/ofproto/tunnel.c
++++ b/ofproto/tunnel.c
+@@ -704,6 +704,7 @@ tnl_port_build_header(const struct ofport_dpif *ofport,
+ 
+     /* Build Ethernet and IP headers. */
+     memset(data->header, 0, sizeof data->header);
++    data->exts = 0;
+ 
+     eth = (struct eth_header *)data->header;
+     eth->eth_dst = dmac;
+diff --git a/tests/ofproto.at b/tests/ofproto.at
+index 7141e39..98f4872 100644
+--- a/tests/ofproto.at
++++ b/tests/ofproto.at
+@@ -1927,7 +1927,6 @@ metadata in_port in_port_oxm pkt_mark ct_mark ct_label reg0 reg1 reg2 reg3 reg4
+       nsh_np: arbitrary mask
+       encap_eth_src: arbitrary mask
+       encap_eth_dst: arbitrary mask
+-      encap_eth_type: exact match or wildcard
+ 
+ ' $1
+ }
+diff --git a/tests/tunnel.at b/tests/tunnel.at
+index d957574..7162ef0 100644
+--- a/tests/tunnel.at
++++ b/tests/tunnel.at
+@@ -427,6 +427,14 @@ in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_fie
+ in_port=2 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,set_field:4->tun_gpe_np,output:2
+ ])
+ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
++		br0 65534/100: (dummy)
++		p1 1/1: (dummy)
++		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
++		p90 90/90: (dummy)
++])
++
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+   [Datapath actions: push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),1,set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,vxlan(gpe(np=0x4,flags=0)),flags(df|key))),push_nsh(nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),4790
+@@ -496,12 +504,6 @@ priority=200,in_port=2,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_typ
+ 
+ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ 
+-AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
+-		br0 65534/100: (dummy)
+-		p1 1/1: (dummy)
+-		p2 2/2: (dummy)
+-])
+-
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(2),encap_eth(encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+   [Datapath actions: pop_eth,pop_nsh,1
+@@ -525,12 +527,6 @@ priority=200,in_port=2,tun_gpe_np=4,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,
+ 
+ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ 
+-AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
+-		br0 65534/100: (dummy)
+-		p1 1/1: (dummy)
+-		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
+-])
+-
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(src=1.1.1.1,dst=1.2.3.4,ttl=64,flags(),vxlan(gpe(np=4,flags=0x0c))),in_port(4790),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+   [Datapath actions: push_eth(encap_eth_type=35151,encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,),1
+@@ -553,21 +549,184 @@ priority=200,in_port=1,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_typ
+ 
+ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ 
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(1),encap_eth(encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa),,nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,vxlan(gpe(np=0x4,flags=0)),flags(df|key))),pop_eth,4790
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([tunnel - VXLAN-GPE and NSH - Encapsulation - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++
++ADD_OF_PORTS([br0], [90])
++
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 2.2.2.22/24], [0], [OK
++])
++AT_CHECK([
++ovs-appctl ovs/route/add 1.1.1.1/24 br0
++ovs-appctl tnl/arp/set br0 1.1.1.1 00:11:11:11:11:11
++],[0],[stdout])
++
++AT_DATA([flows.txt], [dnl
++in_port=90 actions=resubmit:1,resubmit:2
++in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,output:1
++in_port=2 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,set_field:4->tun_gpe_np,output:2
++])
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: push_nsh(encap_eth_src=00:00:00:00:00:00,encap_eth_dst=00:00:00:00:00:00,nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),1,push_nsh(encap_eth_src=00:00:00:00:00:00,encap_eth_dst=00:00:00:00:00:00,nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=3723427584),tnl_push(tnl_port(4790),header(size=50,type=4,eth(dst=00:11:11:11:11:11,src=aa:55:aa:55:00:00,dl_type=0x0800),ipv4(src=2.2.2.22,dst=1.1.1.1,proto=17,tos=0,ttl=64,frag=0x40),udp(src=0,dst=4790,csum=0x0),vxlan(flags=0xc000004,vni=0x0)),out_port(100))
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([tunnel - VXLAN-GPE and NSH - Decapsulation - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=2,tun_gpe_np=4,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,actions=pop_nsh,output=1
++priority=100,in_port=1,actions=local
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.1.2/24], [0], [OK
++])
++
++AT_CHECK([ovs-appctl ovs/route/add 1.1.1.1/24 br0], [0], [OK
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:05,dst=aa:55:aa:55:00:00),eth_type(0x0800),ipv4(src=1.1.1.1,dst=1.1.1.2,proto=17,tos=0,ttl=64,frag=no),udp(src=51283,dst=4790)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: tnl_pop(4790)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(src=1.1.1.1,dst=1.2.3.4,ttl=64,flags(),vxlan(gpe(np=4,flags=0x0c))),in_port(4790),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: pop_nsh,1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([Eth and NSH - Encapsulation - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++
++ADD_OF_PORTS([br0], [90])
++AT_DATA([flows.txt], [dnl
++in_port=90 actions=resubmit:1,resubmit:2
++in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:1
++])
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(90),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++[Datapath actions: push_nsh(encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=287454020,nshc2=1432778632,nshc3=2578103244,nshc4=0),1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([Eth and NSH - Decapsulation - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=2,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,actions=pop_nsh,output=1
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
+ AT_CHECK([ovs-appctl dpif/show | tail -n +3], [0], [dnl
+ 		br0 65534/100: (dummy)
+ 		p1 1/1: (dummy)
+-		p2 2/4790: (vxlan: dst_port=4790, key=flow, remote_ip=1.1.1.1)
++		p2 2/2: (dummy)
+ ])
+ 
+-AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(1),encap_eth(encap_eth_type=0x894f,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa),,nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(2),nsh(encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+-  [Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,vxlan(gpe(np=0x4,flags=0)),flags(df|key))),pop_eth,4790
++  [Datapath actions: pop_nsh,1
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([VXLANGPE+NSH to Eth+NSH - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++	-- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2 \
++        -- add-port br0 p3 -- set Interface p3 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=3 \
++        options:exts=gpe])
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=3,tun_gpe_np=4,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,actions=set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:2
++priority=100,in_port=1,actions=local
++])
++
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.1.2/24], [0], [OK
++])
++
++AT_CHECK([ovs-appctl ovs/route/add 1.1.1.1/24 br0], [0], [OK
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(1),eth(src=50:54:00:00:00:05,dst=aa:55:aa:55:00:00),eth_type(0x0800),ipv4(src=1.1.1.1,dst=1.1.1.2,proto=17,tos=0,ttl=64,frag=no),udp(src=51283,dst=4790)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: tnl_pop(4790)
++])
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(src=1.1.1.1,dst=1.2.3.4,ttl=64,flags(),vxlan(gpe(np=4,flags=0x0c))),in_port(4790),nsh(nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: pop_nsh,push_nsh(encap_eth_src=00:66:77:88:99:aa,encap_eth_dst=00:11:22:33:44:55,nsh_mdtype=1,nsh_np=3,nsp=1122867,nsi=1140850688,nshc1=1144201745,nshc2=2289526357,nshc3=3434850969,nshc4=16772829),2
+ ])
+ 
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+ 
++AT_SETUP([Eth+NSH to VXLANGPE+NSH - user space])
++OVS_VSWITCHD_START([dnl
++        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
++        -- add-port br0 p2 -- set Interface p2 type=vxlan options:key=flow \
++        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
++        options:exts=gpe])
++
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 1.1.1.2/24], [0], [OK
++])
++AT_CHECK([
++ovs-appctl ovs/route/add 1.1.1.1/24 br0
++ovs-appctl tnl/arp/set br0 1.1.1.1 00:11:11:11:11:11
++],[0],[stdout])
++
++AT_DATA([flows.txt], [dnl
++priority=200,in_port=1,nsh_mdtype=1,nsh_np=3,nsi=0x44,nsp=0x112233,encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,actions=set_field:0x4->tun_gpe_np,output=2
++])
+ 
++AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
++
++
++AT_CHECK([ovs-appctl ofproto/trace ovs-dummy ',in_port(1),nsh(encap_eth_dst=00:11:22:33:44:55,encap_eth_src=00:66:77:88:99:aa,nsh_mdtype=1,nsh_np=3,nsp=0x112233,nsi=0x44,nshc1=0x11223344,nshc2=0x55667788,nshc3=0x99aabbcc,nshc4=0xddeeff00),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no),tcp(src=8,dst=9)'], [0], [stdout])
++
++AT_CHECK([tail -1 stdout], [0],
++  [Datapath actions: tnl_push(tnl_port(4790),header(size=50,type=4,eth(dst=00:11:11:11:11:11,src=aa:55:aa:55:00:00,dl_type=0x0800),ipv4(src=1.1.1.2,dst=1.1.1.1,proto=17,tos=0,ttl=64,frag=0x40),udp(src=0,dst=4790,csum=0x0),vxlan(flags=0xc000004,vni=0x0)),out_port(100))
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
+ 
+ AT_SETUP([tunnel - Geneve metadata])
+ OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=geneve \
+-- 
+1.9.3
+

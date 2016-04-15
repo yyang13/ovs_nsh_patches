@@ -1,0 +1,74 @@
+From 604bcfaf5211513f665ca05a370bc7f0c0dab39f Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Fri, 15 Apr 2016 14:17:54 +0800
+Subject: [PATCH 5/5] Ethernet header must be kept in VxLAN-gpe + eth + NSH for
+ new ovs lwtunnel implementation
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/linux/compat/vxlan.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/datapath/linux/compat/vxlan.c b/datapath/linux/compat/vxlan.c
+index 888d431..3c05141 100644
+--- a/datapath/linux/compat/vxlan.c
++++ b/datapath/linux/compat/vxlan.c
+@@ -821,7 +821,7 @@ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ 	struct vxlan_dev *vxlan;
+ 	struct pcpu_sw_netstats *stats;
+ 	union vxlan_addr saddr;
+-        struct eth_nsh_hdr *eth_nsh_header = NULL;
++        //struct eth_nsh_hdr *eth_nsh_header = NULL;
+ 	int err = 0;
+ 
+ 	/* For flow based devices, map all packets to VNI 0 */
+@@ -891,12 +891,13 @@ static void vxlan_rcv(struct vxlan_sock *vs, struct sk_buff *skb,
+ 	u64_stats_update_end(&stats->syncp);
+ 
+         /* Add a faked encap_eth_header for NSH */
+-        if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
++        /* ovs changes have ensured it is here, so needn't add it any more */
++        /*if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
+             skb_push(skb, ENCAP_ETH_LEN);
+             eth_nsh_header = (struct eth_nsh_hdr *)skb->data;
+             memmove(eth_nsh_header->encap_eth_header.encap_eth_dst, skb_mac_header(skb), ENCAP_ETH_LEN);
+             eth_nsh_header->encap_eth_header.encap_eth_type = htons(ETH_P_NSH);
+-        }
++        }*/
+  
+ 	netdev_port_receive(skb, skb_tunnel_info(skb));
+ 	return;
+@@ -985,7 +986,7 @@ static int vxlan_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
+ 		struct vxlanhdr_gpe *gpe;
+ 
+ 		gpe = (struct vxlanhdr_gpe *)vxh;
+-		md->gpe = ntohs(gpe->next_proto);
++		md->gpe = gpe->next_proto;
+ 
+ 		buf.dst.u.tun_info.key.tun_flags |= TUNNEL_VXLAN_OPT;
+ 
+@@ -1189,9 +1190,10 @@ static int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *sk
+ 	}
+ 
+         /* Skip encap_eth_header on sending Eth+NSH to vxlan-gpe port */
+-        if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
++        /* ovs needs to keep eth header here */
++        /*if (md && ((md->gpe & VXLAN_GPE_NP_MASK) == VXLAN_GPE_NP_NSH)) {
+             skb_pull(skb, ENCAP_ETH_LEN);
+-        }
++        }*/
+ 
+ 	min_headroom = LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len
+ 			+ VXLAN_HLEN + sizeof(struct iphdr)
+@@ -1236,6 +1238,8 @@ static int vxlan_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *sk
+ 	}
+ 	if (vxflags & VXLAN_F_GBP)
+ 		vxlan_build_gbp_hdr(vxh, vxflags, md);
++        else if (vxflags & VXLAN_F_GPE)
++                vxlan_build_gpe_hdr(vxh, vxflags, md);
+ 
+ 	ovs_skb_set_inner_protocol(skb, htons(ETH_P_TEB));
+ 
+-- 
+1.9.3
+

@@ -21,7 +21,7 @@ $ git clone https://github.com/openvswitch/ovs.git
 
 $ cd ovs
 
-$ git reset 7d433ae57ebb90cd68e8fa948a096f619ac4e2d8
+$ git reset --hard 7d433ae57ebb90cd68e8fa948a096f619ac4e2d8
 
 $ cp ../ovs_nsh_patches/*.patch ./
 

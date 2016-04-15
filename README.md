@@ -35,3 +35,12 @@ If you want to overwrite local ovs installation, please also run it, but please 
 ```
 $ sudo make install
 ```
+
+Test network topology
+---------------------
+![Test Network Topology](https://raw.githubusercontent.com/yyang13/ovs_nsh_patches/master/test-topo.png)
+
+Openflow tables
+---------------
+[test-flows-host1.txt]
+[test-flows-host2.txt]

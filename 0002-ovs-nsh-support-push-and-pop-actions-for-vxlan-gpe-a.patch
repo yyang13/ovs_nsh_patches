@@ -2589,7 +2589,7 @@ index 0c033da..d957574 100644
 +        options:exts=gpe])
 +
 +OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
-+ADD_OF_PORTS([br0], [90])
++add_of_ports br0 90
 +AT_DATA([flows.txt], [dnl
 +in_port=90 actions=resubmit:1,resubmit:2
 +in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:0xddeeff00->nshc4,output:1
@@ -2638,7 +2638,7 @@ index 0c033da..d957574 100644
 +        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
 +
 +OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP
-+ADD_OF_PORTS([br0], [90])
++add_of_ports br0 90
 +AT_DATA([flows.txt], [dnl
 +in_port=90 actions=resubmit:1,resubmit:2
 +in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,push_eth,set_field:0x894f->encap_eth_type,set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:1

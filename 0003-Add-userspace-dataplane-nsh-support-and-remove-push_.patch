@@ -2153,7 +2153,7 @@ index d957574..7162ef0 100644
 +        options:remote_ip=1.1.1.1 options:dst_port=4790 ofport_request=2 \
 +        options:exts=gpe])
 +
-+ADD_OF_PORTS([br0], [90])
++add_of_ports br0 90
 +
 +AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 2.2.2.22/24], [0], [OK
 +])
@@ -2214,7 +2214,7 @@ index d957574..7162ef0 100644
 +        add-port br0 p1 -- set Interface p1 type=dummy ofport_request=1 \
 +        -- add-port br0 p2 -- set Interface p2 type=dummy ofport_request=2])
 +
-+ADD_OF_PORTS([br0], [90])
++add_of_ports br0 90
 +AT_DATA([flows.txt], [dnl
 +in_port=90 actions=resubmit:1,resubmit:2
 +in_port=1 actions=push_nsh,set_field:1->nsh_mdtype,set_field:0x3->nsh_np,set_field:0x112233->nsp,set_field:0x44->nsi,set_field:0x11223344->nshc1,set_field:0x55667788->nshc2,set_field:0x99aabbcc->nshc3,set_field:00:11:22:33:44:55->encap_eth_dst,set_field:00:66:77:88:99:aa->encap_eth_src,output:1

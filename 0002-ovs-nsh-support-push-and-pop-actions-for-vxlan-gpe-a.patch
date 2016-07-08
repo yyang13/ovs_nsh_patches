@@ -1,7 +1,7 @@
 From bd251cb247ac44e4362215da826e9bf1d6c61f27 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 13 Apr 2016 11:15:42 +0800
-Subject: [PATCH 2/5] ovs-nsh: support push and pop actions for vxlan-gpe and
+Subject: [PATCH 2/6] ovs-nsh: support push and pop actions for vxlan-gpe and
  Ethernet nsh
 
 Signed-off-by: Mengke Liu <mengke.liu@intel.com>

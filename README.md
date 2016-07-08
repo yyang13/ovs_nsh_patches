@@ -9,6 +9,7 @@ patch file list
 0003-Add-userspace-dataplane-nsh-support-and-remove-push_.patch
 0004-Fix-too-large-stack-frame-size.patch
 0005-Ethernet-header-must-be-kept-in-VxLAN-gpe-eth-NSH-fo.patch
+0006-Fix-VxLAN-gpe-Eth-NSH-issues.patch
 ```
 
 How to apply them

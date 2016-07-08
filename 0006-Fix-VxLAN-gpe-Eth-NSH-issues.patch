@@ -1,0 +1,82 @@
+From 16982ccaf9249550d01d1ef5d298f97ee6537eb0 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 27 Apr 2016 14:50:29 +0800
+Subject: [PATCH 6/6] Fix VxLAN-gpe + Eth + NSH issues
+
+ - Set encap_eth_type to 0x894F on doing push_nsh
+   in kernel data path
+ - Set VxLAN-gpe next protocol present bit
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/actions.c            | 1 +
+ datapath/linux/compat/vxlan.c | 8 ++++----
+ lib/flow.c                    | 2 +-
+ lib/odp-util.c                | 2 +-
+ 4 files changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/datapath/actions.c b/datapath/actions.c
+index 7072638..ffa1f04 100644
+--- a/datapath/actions.c
++++ b/datapath/actions.c
+@@ -275,6 +275,7 @@ static int push_nsh(struct sk_buff *skb, struct sw_flow_key *key,
+ 		OVS_CB(skb)->encap_eth_header = (struct encap_eth_hdr *)skb->data;
+ 		OVS_CB(skb)->nsh_header = (struct nsh_hdr *)(skb->data + ENCAP_ETH_LEN);
+ 		memcpy(skb->data, nsh->header, ETH_NSH_TYPE1_HEADER_SIZE);
++                OVS_CB(skb)->encap_eth_header->encap_eth_type = htons(ETH_P_NSH);
+ 	}
+ 	else
+ 		return -EINVAL;
+diff --git a/datapath/linux/compat/vxlan.c b/datapath/linux/compat/vxlan.c
+index 3c05141..05fb226 100644
+--- a/datapath/linux/compat/vxlan.c
++++ b/datapath/linux/compat/vxlan.c
+@@ -1051,15 +1051,15 @@ static void vxlan_build_gpe_hdr(struct vxlanhdr *vxh, u32 vxflags,
+ {
+        struct vxlanhdr_gpe *gpe;
+ 
+-       if (!md->gpe)
+-               return;
+-
+        gpe = (struct vxlanhdr_gpe*)vxh;
+        vxh->vx_flags |= htonl(VXLAN_HF_GPE);
+ 
+        if (md->gpe & VXLAN_GPE_OAM_FLAG)
+                gpe->oam_flag = 1;
+-       gpe->next_proto = md->gpe & VXLAN_GPE_NP_MASK;
++       if (md->gpe == 0)
++               gpe->next_proto = VXLAN_GPE_NP_NSH;
++       else
++               gpe->next_proto = md->gpe & VXLAN_GPE_NP_MASK;
+ }
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+diff --git a/lib/flow.c b/lib/flow.c
+index 887b023..6710e20 100644
+--- a/lib/flow.c
++++ b/lib/flow.c
+@@ -915,7 +915,7 @@ flow_get_metadata(const struct flow *flow, struct match *flow_metadata)
+     if (flow->tunnel.gbp_flags) {
+         match_set_tun_gbp_flags(flow_metadata, flow->tunnel.gbp_flags);
+     }
+-    if (flow->tunnel.gpe_np != htons(0)) {
++    if (flow->tunnel.gpe_np != 0) {
+         match_set_tun_gpe_np(flow_metadata, flow->tunnel.gpe_np);
+     }
+     if (flow->tunnel.gpe_flags) {
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 7721cc4..51f0545 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -1982,7 +1982,7 @@ odp_tun_key_from_attr__(const struct nlattr *attr,
+             };
+             struct nlattr *ext[ARRAY_SIZE(vxlan_opts_policy)];
+ 
+-            if (!nl_parse_nested(a, vxlan_opts_policy, ext, ARRAY_SIZE(ext))) {
++            if (!nl_parse_nested(a, vxlan_opts_policy, ext, ARRAY_SIZE(vxlan_opts_policy))) {
+                 return ODP_FIT_ERROR;
+             }
+ 
+-- 
+1.9.3
+

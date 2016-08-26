@@ -1,7 +1,7 @@
 From ec5272ed6684bbd0ae8c38a5e6488414347a941f Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 13 Apr 2016 16:39:27 +0800
-Subject: [PATCH 3/6] Add userspace dataplane nsh support and remove push_eth
+Subject: [PATCH 3/7] Add userspace dataplane nsh support and remove push_eth
  and pop_eth actions
 
 Signed-off-by: Mengke Liu <mengke.liu@intel.com>

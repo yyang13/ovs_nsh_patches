@@ -1,0 +1,136 @@
+From 800aaff26541177dec9172a77d7f251d6165c8ae Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Fri, 26 Aug 2016 09:21:20 +0800
+Subject: [PATCH 7/7] Fix ovs dpdk issues
+
+ - Correct format_nsh error
+ - Add Ethernet header for the NSH packet decapsulated from VxLAN-gpe port
+ - Fix flow key to flow conversion issue for nsh
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ lib/dpif-netdev.c  |  7 +++++--
+ lib/netdev-vport.c | 18 +++++++++++++++++-
+ lib/odp-util.c     |  8 +++-----
+ lib/packets.c      | 16 ++++++++++++++--
+ 4 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index d40cae4..31f80d4 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -1963,8 +1963,11 @@ dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
+                               struct flow *flow)
+ {
+     odp_port_t in_port;
++    enum odp_key_fitness fitness;
++
++    fitness = odp_flow_key_to_flow_udpif(key, key_len, flow);
+ 
+-    if (odp_flow_key_to_flow_udpif(key, key_len, flow)) {
++    if (fitness) {
+         /* This should not happen: it indicates that odp_flow_key_from_flow()
+          * and odp_flow_key_to_flow() disagree on the acceptable form of a
+          * flow.  Log the problem as an error, with enough details to enable
+@@ -1976,7 +1979,7 @@ dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
+ 
+             ds_init(&s);
+             odp_flow_format(key, key_len, NULL, 0, NULL, &s, true);
+-            VLOG_ERR("internal error parsing flow key %s", ds_cstr(&s));
++            VLOG_ERR("internal error parsing flow key %s (%s)", ds_cstr(&s), odp_key_fitness_to_string(fitness));
+             ds_destroy(&s);
+         }
+ 
+diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
+index 67a020a..d2e6b0c 100644
+--- a/lib/netdev-vport.c
++++ b/lib/netdev-vport.c
+@@ -1309,7 +1309,6 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
+         return EINVAL;
+     }
+ 
+-
+     /* vxlan-gpe packets*/
+     flag = get_16aligned_be32(&vxh->vx_flags);
+ 
+@@ -1332,6 +1331,23 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
+         /* Drop the OAM packets */
+         if (gpe->oam_flag)
+             return EINVAL;
++
++        tnl->tun_id = htonll(ntohl(get_16aligned_be32(&vxh->vx_vni)) >> 8);
++        tnl->flags |= FLOW_TNL_F_KEY;
++
++        if (tnl->gpe_np == VXLAN_GPE_NP_NSH) {
++            /* Add a faked ethernet header which type is 0x894F, so the OVS
++             * can receive frame starting with ethernet header.
++             */
++            struct eth_header * encap_eth;
++            struct eth_header * eth = dp_packet_l2(packet);
++
++            memmove((char *)eth + VXLAN_HLEN - ENCAP_ETH_LEN, eth, 2 * ETH_ADDR_LEN);
++            dp_packet_reset_packet(packet, hlen + VXLAN_HLEN - ENCAP_ETH_LEN);
++            encap_eth = dp_packet_data(packet);
++            encap_eth->eth_type = htons(ETH_P_NSH);
++        } else
++            dp_packet_reset_packet(packet, hlen + VXLAN_HLEN);
+     } else {
+         if (flag != htonl(VXLAN_FLAGS) ||
+            (get_16aligned_be32(&vxh->vx_vni) & htonl(0xff))) {
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 51f0545..0190d28 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -393,8 +393,8 @@ format_nsh(struct ds *ds, const struct ovs_action_push_nsh * nsh)
+ 		  ",nshc3=%"PRIu32",nshc4=%"PRIu32")",
+                   eth_nsh_header->nsh_hdr.base.mdtype,
+                   eth_nsh_header->nsh_hdr.base.proto,
+-                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr << 8),
+-                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr >> 24),
++                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr) >> 8,
++                  ntohl(eth_nsh_header->nsh_hdr.base.path_hdr) & 0xFF,
+                   ntohl(eth_nsh_header->nsh_hdr.ctx.nshc1),
+                   ntohl(eth_nsh_header->nsh_hdr.ctx.nshc2),
+                   ntohl(eth_nsh_header->nsh_hdr.ctx.nshc3),
+@@ -5413,9 +5413,7 @@ odp_flow_key_to_flow__(const struct nlattr *key, size_t key_len,
+ 
+         nsh_key = nl_attr_get(attrs[OVS_KEY_ATTR_NSH]);
+         put_nsh_key(nsh_key, flow);
+-        if (is_mask) {
+-            expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_NSH;
+-        }
++        expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_NSH;
+     }
+ 
+     /* Ethernet header. */
+diff --git a/lib/packets.c b/lib/packets.c
+index d314b2d..811d558 100644
+--- a/lib/packets.c
++++ b/lib/packets.c
+@@ -259,9 +259,21 @@ push_nsh(struct dp_packet *packet, const void *nsh)
+ void
+ pop_nsh(struct dp_packet *packet)
+ {
++    struct eth_header * outer_eth = NULL;
++    struct eth_header * inner_eth = NULL;
++
+     if (ETH_NSH_TYPE1_HEADER_SIZE > dp_packet_size(packet)) {
+-       	return;
+-    }   
++        return;
++    }
++
++    outer_eth = dp_packet_l2(packet);
++    inner_eth = dp_packet_at(packet, ETH_NSH_TYPE1_HEADER_SIZE, sizeof(struct eth_header));
++
++    /* set(eth(dst,src)) changed outer header but not inner header,
++     * so have to copy it.
++     */
++    memcpy(&inner_eth->eth_dst, &outer_eth->eth_dst, 2 * ETH_ADDR_LEN);
++
+     dp_packet_reset_packet(packet, ETH_NSH_TYPE1_HEADER_SIZE);
+ }
+ 
+-- 
+1.9.3
+

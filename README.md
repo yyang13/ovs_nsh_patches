@@ -60,6 +60,14 @@ Test network topology
 ![Test Network Topology](https://raw.githubusercontent.com/yyang13/ovs_nsh_patches/master/test-topo.png)
 
 Openflow tables
----------------
+===============
+
+Non-DPDK version
+----------------
 - [test-flows-host1.txt](https://github.com/yyang13/ovs_nsh_patches/blob/master/test-flows-host1.txt)
 - [test-flows-host2.txt](https://github.com/yyang13/ovs_nsh_patches/blob/master/test-flows-host2.txt)
+
+DPDK version
+----------------
+- [test-flows-dpdk-host1.txt](https://github.com/yyang13/ovs_nsh_patches/blob/master/test-flows-dpdk-host1.txt)
+- [test-flows-dpdk-host2.txt](https://github.com/yyang13/ovs_nsh_patches/blob/master/test-flows-dpdk-host2.txt)

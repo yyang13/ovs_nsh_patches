@@ -1,4 +1,4 @@
-From 800aaff26541177dec9172a77d7f251d6165c8ae Mon Sep 17 00:00:00 2001
+From f7ccafd1a60f1d91d8205c945d88715a707655eb Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Fri, 26 Aug 2016 09:21:20 +0800
 Subject: [PATCH 7/7] Fix ovs dpdk issues
@@ -6,6 +6,7 @@ Subject: [PATCH 7/7] Fix ovs dpdk issues
  - Correct format_nsh error
  - Add Ethernet header for the NSH packet decapsulated from VxLAN-gpe port
  - Fix flow key to flow conversion issue for nsh
+ - Copy inner Ethernet addresses for NSH from VxLAN-gpe
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---
@@ -42,7 +43,7 @@ index d40cae4..31f80d4 100644
          }
  
 diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
-index 67a020a..d2e6b0c 100644
+index 67a020a..94f23d9 100644
 --- a/lib/netdev-vport.c
 +++ b/lib/netdev-vport.c
 @@ -1309,7 +1309,6 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
@@ -68,7 +69,7 @@ index 67a020a..d2e6b0c 100644
 +            struct eth_header * encap_eth;
 +            struct eth_header * eth = dp_packet_l2(packet);
 +
-+            memmove((char *)eth + VXLAN_HLEN - ENCAP_ETH_LEN, eth, 2 * ETH_ADDR_LEN);
++            memmove((char *)eth + hlen + VXLAN_HLEN - ENCAP_ETH_LEN, (char *)eth + hlen + VXLAN_HLEN + NSH_PUSH_TYPE1_HEADER_SIZE, 2 * ETH_ADDR_LEN);
 +            dp_packet_reset_packet(packet, hlen + VXLAN_HLEN - ENCAP_ETH_LEN);
 +            encap_eth = dp_packet_data(packet);
 +            encap_eth->eth_type = htons(ETH_P_NSH);

@@ -1,4 +1,4 @@
-From f7ccafd1a60f1d91d8205c945d88715a707655eb Mon Sep 17 00:00:00 2001
+From faa1ed3acc3be170ce571a75e1ec03a09aca179e Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Fri, 26 Aug 2016 09:21:20 +0800
 Subject: [PATCH 7/7] Fix ovs dpdk issues
@@ -6,15 +6,14 @@ Subject: [PATCH 7/7] Fix ovs dpdk issues
  - Correct format_nsh error
  - Add Ethernet header for the NSH packet decapsulated from VxLAN-gpe port
  - Fix flow key to flow conversion issue for nsh
- - Copy inner Ethernet addresses for NSH from VxLAN-gpe
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---
  lib/dpif-netdev.c  |  7 +++++--
  lib/netdev-vport.c | 18 +++++++++++++++++-
  lib/odp-util.c     |  8 +++-----
- lib/packets.c      | 16 ++++++++++++++--
- 4 files changed, 39 insertions(+), 10 deletions(-)
+ lib/packets.c      |  5 +++--
+ 4 files changed, 28 insertions(+), 10 deletions(-)
 
 diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
 index d40cae4..31f80d4 100644
@@ -105,33 +104,21 @@ index 51f0545..0190d28 100644
  
      /* Ethernet header. */
 diff --git a/lib/packets.c b/lib/packets.c
-index d314b2d..811d558 100644
+index d314b2d..4c9a019 100644
 --- a/lib/packets.c
 +++ b/lib/packets.c
-@@ -259,9 +259,21 @@ push_nsh(struct dp_packet *packet, const void *nsh)
- void
+@@ -260,8 +260,9 @@ void
  pop_nsh(struct dp_packet *packet)
  {
-+    struct eth_header * outer_eth = NULL;
-+    struct eth_header * inner_eth = NULL;
-+
      if (ETH_NSH_TYPE1_HEADER_SIZE > dp_packet_size(packet)) {
 -       	return;
 -    }   
 +        return;
 +    }
 +
-+    outer_eth = dp_packet_l2(packet);
-+    inner_eth = dp_packet_at(packet, ETH_NSH_TYPE1_HEADER_SIZE, sizeof(struct eth_header));
-+
-+    /* set(eth(dst,src)) changed outer header but not inner header,
-+     * so have to copy it.
-+     */
-+    memcpy(&inner_eth->eth_dst, &outer_eth->eth_dst, 2 * ETH_ADDR_LEN);
-+
      dp_packet_reset_packet(packet, ETH_NSH_TYPE1_HEADER_SIZE);
  }
  
 -- 
-1.9.3
+2.1.0
 

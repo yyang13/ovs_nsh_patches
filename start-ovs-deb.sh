@@ -25,6 +25,8 @@ sudo rm /tmp/ovsdb.txt
 touch /tmp/ovsdb.txt
 sudo rm /tmp/vswitch.txt
 touch /tmp/vswitch.txt
+git config user.email "yi.y.yang@intel.com"
+git config user.name "Yi Yang"
 git clone https://github.com/openvswitch/ovs.git
 git clone https://github.com/yyang13/ovs_nsh_patches.git
 cd ovs

@@ -1,0 +1,259 @@
+From 9bd18a89542f910ce12b09fe3e03f08a22b691dd Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Mon, 14 Nov 2016 13:12:51 +0800
+Subject: [PATCH 3/5] Fix too large stack frame size
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/datapath.c | 92 +++++++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 78 insertions(+), 14 deletions(-)
+
+diff --git a/datapath/datapath.c b/datapath/datapath.c
+index db8a18a..ae6555f 100644
+--- a/datapath/datapath.c
++++ b/datapath/datapath.c
+@@ -939,7 +939,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	struct sw_flow_mask mask;
+ 	struct sk_buff *reply;
+ 	struct datapath *dp;
+-	struct sw_flow_key key;
++	struct sw_flow_key *key = NULL;
+ 	struct sw_flow_actions *acts;
+ 	struct sw_flow_match match;
+ 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
+@@ -957,6 +957,12 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 		goto error;
+ 	}
+ 
++        error = -ENOMEM;
++        key = kzalloc(sizeof(struct sw_flow_key), GFP_KERNEL);
++        if (key == NULL) {
++               goto error;
++        }
++
+ 	/* Most of the time we need to allocate a new flow, do it before
+ 	 * locking.
+ 	 */
+@@ -967,17 +973,17 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	}
+ 
+ 	/* Extract key. */
+-	ovs_match_init(&match, &key, &mask);
++	ovs_match_init(&match, key, &mask);
+ 	error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
+ 				  a[OVS_FLOW_ATTR_MASK], log);
+ 	if (error)
+ 		goto err_kfree_flow;
+ 
+-	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
++	ovs_flow_mask_key(&new_flow->key, key, true, &mask);
+ 
+ 	/* Extract flow identifier. */
+ 	error = ovs_nla_get_identifier(&new_flow->id, a[OVS_FLOW_ATTR_UFID],
+-				       &key, log);
++				       key, log);
+ 	if (error)
+ 		goto err_kfree_flow;
+ 
+@@ -1007,7 +1013,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 	if (ovs_identifier_is_ufid(&new_flow->id))
+ 		flow = ovs_flow_tbl_lookup_ufid(&dp->table, &new_flow->id);
+ 	if (!flow)
+-		flow = ovs_flow_tbl_lookup(&dp->table, &key);
++		flow = ovs_flow_tbl_lookup(&dp->table, key);
+ 	if (likely(!flow)) {
+ 		rcu_assign_pointer(new_flow->sf_acts, acts);
+ 
+@@ -1077,6 +1083,10 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	if (reply)
+ 		ovs_notify(&dp_flow_genl_family, &ovs_dp_flow_multicast_group, reply, info);
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return 0;
+ 
+ err_unlock_ovs:
+@@ -1087,6 +1097,10 @@ err_kfree_acts:
+ err_kfree_flow:
+ 	ovs_flow_free(new_flow, false);
+ error:
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return error;
+ }
+ 
+@@ -1117,7 +1131,7 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 	struct net *net = sock_net(skb->sk);
+ 	struct nlattr **a = info->attrs;
+ 	struct ovs_header *ovs_header = info->userhdr;
+-	struct sw_flow_key key;
++	struct sw_flow_key *key = NULL;
+ 	struct sw_flow *flow;
+ 	struct sw_flow_mask mask;
+ 	struct sk_buff *reply = NULL;
+@@ -1130,9 +1144,15 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
+ 	bool ufid_present;
+ 
++        error = -ENOMEM;
++        key = kzalloc(sizeof(struct sw_flow_key), GFP_KERNEL);
++        if (key == NULL) {
++               goto error;
++        }
++
+ 	ufid_present = ovs_nla_get_ufid(&sfid, a[OVS_FLOW_ATTR_UFID], log);
+ 	if (a[OVS_FLOW_ATTR_KEY]) {
+-		ovs_match_init(&match, &key, &mask);
++		ovs_match_init(&match, key, &mask);
+ 		error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
+ 					  a[OVS_FLOW_ATTR_MASK], log);
+ 	} else if (!ufid_present) {
+@@ -1152,7 +1172,7 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 			goto error;
+ 		}
+ 
+-		acts = get_flow_actions(net, a[OVS_FLOW_ATTR_ACTIONS], &key,
++		acts = get_flow_actions(net, a[OVS_FLOW_ATTR_ACTIONS], key,
+ 					&mask, log);
+ 		if (IS_ERR(acts)) {
+ 			error = PTR_ERR(acts);
+@@ -1220,6 +1240,10 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
+ 	if (old_acts)
+ 		ovs_nla_free_flow_actions_rcu(old_acts);
+ 
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return 0;
+ 
+ err_unlock_ovs:
+@@ -1228,6 +1252,10 @@ err_unlock_ovs:
+ err_kfree_acts:
+ 	ovs_nla_free_flow_actions(acts);
+ error:
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return error;
+ }
+ 
+@@ -1236,7 +1264,7 @@ static int ovs_flow_cmd_get(struct sk_buff *skb, struct genl_info *info)
+ 	struct nlattr **a = info->attrs;
+ 	struct ovs_header *ovs_header = info->userhdr;
+ 	struct net *net = sock_net(skb->sk);
+-	struct sw_flow_key key;
++	struct sw_flow_key *key = NULL;
+ 	struct sk_buff *reply;
+ 	struct sw_flow *flow;
+ 	struct datapath *dp;
+@@ -1247,9 +1275,15 @@ static int ovs_flow_cmd_get(struct sk_buff *skb, struct genl_info *info)
+ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
+ 	bool ufid_present;
+ 
++        err = -ENOMEM;
++        key = kzalloc(sizeof(struct sw_flow_key), GFP_KERNEL);
++        if (key == NULL) {
++               return err;
++        }
++
+ 	ufid_present = ovs_nla_get_ufid(&ufid, a[OVS_FLOW_ATTR_UFID], log);
+ 	if (a[OVS_FLOW_ATTR_KEY]) {
+-		ovs_match_init(&match, &key, NULL);
++		ovs_match_init(&match, key, NULL);
+ 		err = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY], NULL,
+ 					log);
+ 	} else if (!ufid_present) {
+@@ -1257,9 +1291,13 @@ static int ovs_flow_cmd_get(struct sk_buff *skb, struct genl_info *info)
+ 			  "Flow get message rejected, Key attribute missing.");
+ 		err = -EINVAL;
+ 	}
+-	if (err)
++	if (err) {
++                if (key != NULL) {
++                        kfree(key);
++                        key = NULL;
++                }
+ 		return err;
+-
++        }
+ 	ovs_lock();
+ 	dp = get_dp(sock_net(skb->sk), ovs_header->dp_ifindex);
+ 	if (!dp) {
+@@ -1284,9 +1322,17 @@ static int ovs_flow_cmd_get(struct sk_buff *skb, struct genl_info *info)
+ 	}
+ 
+ 	ovs_unlock();
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return genlmsg_reply(reply, info);
+ unlock:
+ 	ovs_unlock();
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return err;
+ }
+ 
+@@ -1295,7 +1341,7 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	struct nlattr **a = info->attrs;
+ 	struct ovs_header *ovs_header = info->userhdr;
+ 	struct net *net = sock_net(skb->sk);
+-	struct sw_flow_key key;
++	struct sw_flow_key *key = NULL;
+ 	struct sk_buff *reply;
+ 	struct sw_flow *flow = NULL;
+ 	struct datapath *dp;
+@@ -1306,12 +1352,22 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	bool log = !a[OVS_FLOW_ATTR_PROBE];
+ 	bool ufid_present;
+ 
++        err = -ENOMEM;
++        key = kzalloc(sizeof(struct sw_flow_key), GFP_KERNEL);
++        if (key == NULL) {
++               return err;
++        }
++
+ 	ufid_present = ovs_nla_get_ufid(&ufid, a[OVS_FLOW_ATTR_UFID], log);
+ 	if (a[OVS_FLOW_ATTR_KEY]) {
+-		ovs_match_init(&match, &key, NULL);
++		ovs_match_init(&match, key, NULL);
+ 		err = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
+ 					NULL, log);
+ 		if (unlikely(err))
++                        if (key != NULL) {
++                                kfree(key);
++                                key = NULL;
++                        }
+ 			return err;
+ 	}
+ 
+@@ -1361,9 +1417,17 @@ static int ovs_flow_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	}
+ 
+ 	ovs_flow_free(flow, true);
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return 0;
+ unlock:
+ 	ovs_unlock();
++        if (key != NULL) {
++                kfree(key);
++                key = NULL;
++        }
+ 	return err;
+ }
+ 
+-- 
+2.1.0
+

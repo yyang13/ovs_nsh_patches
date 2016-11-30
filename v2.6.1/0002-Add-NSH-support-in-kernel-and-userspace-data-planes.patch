@@ -1,7 +1,7 @@
 From 653c2f6777a6c4f3559a55c8f5a88f4aca313788 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Mon, 14 Nov 2016 12:08:14 +0800
-Subject: [PATCH 2/5] Add NSH support in kernel and userspace data planes
+Subject: [PATCH 2/6] Add NSH support in kernel and userspace data planes
 
 features includes:
   * push_nsh and pop_nsh actions

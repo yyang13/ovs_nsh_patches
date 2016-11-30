@@ -1,7 +1,7 @@
 From 9f7148f9dc03053a4a3231a7cf819c447a178a17 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Fri, 11 Nov 2016 11:13:18 +0800
-Subject: [PATCH 1/5] Enable current VxLAN-gpe work and meet NSH requirements
+Subject: [PATCH 1/6] Enable current VxLAN-gpe work and meet NSH requirements
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---

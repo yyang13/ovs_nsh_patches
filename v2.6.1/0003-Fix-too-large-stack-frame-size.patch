@@ -1,7 +1,7 @@
 From 9bd18a89542f910ce12b09fe3e03f08a22b691dd Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Mon, 14 Nov 2016 13:12:51 +0800
-Subject: [PATCH 3/6] Fix too large stack frame size
+Subject: [PATCH 3/7] Fix too large stack frame size
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---

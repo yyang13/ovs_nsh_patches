@@ -1,0 +1,67 @@
+From dfbdc2b4e12dd5e2aff617e1bc2757e9fc39d1f6 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Thu, 1 Dec 2016 13:36:23 +0800
+Subject: [PATCH 7/7] Fix struct ovs_gso_cb size issue
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ datapath/actions.c  | 6 +++---
+ datapath/datapath.h | 2 --
+ datapath/flow.c     | 2 --
+ 3 files changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/datapath/actions.c b/datapath/actions.c
+index c979596..936a015 100644
+--- a/datapath/actions.c
++++ b/datapath/actions.c
+@@ -278,6 +278,7 @@ static int pop_nsh(struct sk_buff *skb, struct sw_flow_key *key)
+ static int push_nsh(struct sk_buff *skb, struct sw_flow_key *key,
+ 		     const struct ovs_action_push_nsh *nsh)
+ {
++        struct encap_eth_hdr *encap_eth_header = NULL;
+ 
+ 	if (nsh->nsh_mdtype == NSH_M_TYPE1) {
+ 		if (skb_cow_head(skb, ETH_NSH_TYPE1_HEADER_SIZE) < 0) {
+@@ -285,10 +286,9 @@ static int push_nsh(struct sk_buff *skb, struct sw_flow_key *key,
+                 }
+ 
+ 		skb_push(skb, ETH_NSH_TYPE1_HEADER_SIZE);
+-		OVS_CB(skb)->encap_eth_header = (struct encap_eth_hdr *)skb->data;
+-		OVS_CB(skb)->nsh_header = (struct nsh_hdr *)(skb->data + ENCAP_ETH_LEN);
++		encap_eth_header = (struct encap_eth_hdr *)skb->data;
+ 		memcpy(skb->data, nsh->header, ETH_NSH_TYPE1_HEADER_SIZE);
+-                OVS_CB(skb)->encap_eth_header->encap_eth_type = htons(ETH_P_NSH);
++                encap_eth_header->encap_eth_type = htons(ETH_P_NSH);
+ 	}
+ 	else
+ 		return -EINVAL;
+diff --git a/datapath/datapath.h b/datapath/datapath.h
+index a6b2a44..22bbaac 100644
+--- a/datapath/datapath.h
++++ b/datapath/datapath.h
+@@ -108,8 +108,6 @@ struct ovs_skb_cb {
+ 	struct vport		*input_vport;
+ 	u16			mru;
+ 	u32			cutlen;
+-	struct nsh_hdr          *nsh_header;
+-	struct encap_eth_hdr    *encap_eth_header;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
+ 
+diff --git a/datapath/flow.c b/datapath/flow.c
+index 8c4d583..c712517 100644
+--- a/datapath/flow.c
++++ b/datapath/flow.c
+@@ -327,9 +327,7 @@ static int parse_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ static int parse_nsh(struct sk_buff *skb, struct sw_flow_key *key){
+         struct nsh_hdr *nsh_hdr = NULL;
+ 
+-        OVS_CB(skb)->encap_eth_header = (struct encap_eth_hdr *)skb->data;
+ 	nsh_hdr = (struct nsh_hdr *)((const char *)skb->data + ENCAP_ETH_LEN);
+-	OVS_CB(skb)->nsh_header = nsh_hdr;
+ 	memcpy(&key->nsh.encap_eth_dst, skb->data, ENCAP_ETH_LEN);
+ 	key->nsh.nsh_mdtype = nsh_hdr->base.mdtype;
+ 	if (key->nsh.nsh_mdtype != NSH_M_TYPE1)
+-- 
+2.1.0
+

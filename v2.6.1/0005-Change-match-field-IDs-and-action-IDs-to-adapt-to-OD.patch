@@ -1,7 +1,7 @@
 From b6fb68aaf672af71e60ecff9b6b03f1d5f42be0c Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 30 Nov 2016 12:22:19 +0800
-Subject: [PATCH 5/6] Change match field IDs and action IDs to adapt to ODL
+Subject: [PATCH 5/7] Change match field IDs and action IDs to adapt to ODL
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---

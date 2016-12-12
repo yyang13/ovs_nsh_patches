@@ -1,7 +1,7 @@
 From 861f91c172c97b3ea787a1ad30617f31d77f1379 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 30 Nov 2016 10:22:57 +0800
-Subject: [PATCH 4/7] Fix vxlangpe issues on DPDK netdev
+Subject: [PATCH 4/8] Fix vxlangpe issues on DPDK netdev
 
  - Fix a potential deadlock issue
  - Use Ethernet header before NSH header in VxLAN-gpe

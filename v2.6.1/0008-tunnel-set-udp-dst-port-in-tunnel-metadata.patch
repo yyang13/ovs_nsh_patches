@@ -1,0 +1,84 @@
+From add8faa9d4e0b93ea2828d8932ccbc9b740518ae Mon Sep 17 00:00:00 2001
+From: Pravin B Shelar <pshelar@ovn.org>
+Date: Mon, 5 Dec 2016 18:22:11 -0800
+Subject: [PATCH 8/8] tunnel: set udp dst-port in tunnel metadata
+
+VxLan device expect valid tp-dst in tunnel metadata.
+Following patch sets consistent tp-dst with respect to
+the egress tunnel port.
+
+Reported-by: Gerhard Stenzel <gstenzel@linux.vnet.ibm.com>
+Tested-by: Gerhard Stenzel <gstenzel@linux.vnet.ibm.com>
+Signed-off-by: Pravin B Shelar <pshelar@ovn.org>
+Acked-by: Jarno Rajahalme <jarno@ovn.org>
+---
+ ofproto/tunnel.c      | 1 +
+ tests/ofproto-dpif.at | 2 +-
+ tests/tunnel.at       | 8 ++++----
+ 3 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/ofproto/tunnel.c b/ofproto/tunnel.c
+index 9a69071..7277fa0 100644
+--- a/ofproto/tunnel.c
++++ b/ofproto/tunnel.c
+@@ -438,6 +438,7 @@ tnl_port_send(const struct ofport_dpif *ofport, struct flow *flow,
+     flow->pkt_mark |= tnl_port->match.pkt_mark;
+     wc->masks.pkt_mark |= tnl_port->match.pkt_mark;
+ 
++    flow->tunnel.tp_dst = cfg->dst_port;
+     if (!cfg->out_key_flow) {
+         flow->tunnel.tun_id = cfg->out_key;
+     }
+diff --git a/tests/ofproto-dpif.at b/tests/ofproto-dpif.at
+index a71282c..99db282 100644
+--- a/tests/ofproto-dpif.at
++++ b/tests/ofproto-dpif.at
+@@ -6340,7 +6340,7 @@ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(3),eth(src=50:54:00:00:00:
+ dnl Make sure flow sample action in datapath is behind set tunnel
+ dnl action at egress point of tunnel port.
+ AT_CHECK([tail -1 stdout], [0], [dnl
+-Datapath actions: set(tunnel(tun_id=0x5,src=2.2.2.2,dst=1.1.1.1,tos=0x1,ttl=64,flags(df|key))),sample(sample=100.0%,actions(userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=1),tunnel_out_port=1))),1,set(tunnel(tun_id=0x6,src=2.2.2.3,dst=1.1.1.2,tos=0x1,ttl=64,flags(df|key))),sample(sample=100.0%,actions(userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=7471),tunnel_out_port=7471))),7471
++Datapath actions: set(tunnel(tun_id=0x5,src=2.2.2.2,dst=1.1.1.1,tos=0x1,ttl=64,flags(df|key))),sample(sample=100.0%,actions(userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=1),tunnel_out_port=1))),1,set(tunnel(tun_id=0x6,src=2.2.2.3,dst=1.1.1.2,tos=0x1,ttl=64,tp_dst=7471,flags(df|key))),sample(sample=100.0%,actions(userspace(pid=0,flow_sample(probability=65535,collector_set_id=1,obs_domain_id=0,obs_point_id=0,output_port=7471),tunnel_out_port=7471))),7471
+ ])
+ 
+ dnl Remove the flow which contains sample action.
+diff --git a/tests/tunnel.at b/tests/tunnel.at
+index eb429d3..03119bd 100644
+--- a/tests/tunnel.at
++++ b/tests/tunnel.at
+@@ -866,7 +866,7 @@ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ dnl Option generation
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'in_port(2),eth(src=50:54:00:00:00:05,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=1,tos=0,ttl=128,frag=no),icmp(type=8,code=0)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+-  [Datapath actions: set(tunnel(dst=1.1.1.1,ttl=64,geneve({class=0xffff,type=0,len=4,0xa}{class=0xffff,type=0x1,len=8,0x1234567890abcdef}),flags(df))),6081
++  [Datapath actions: set(tunnel(dst=1.1.1.1,ttl=64,tp_dst=6081,geneve({class=0xffff,type=0,len=4,0xa}{class=0xffff,type=0x1,len=8,0x1234567890abcdef}),flags(df))),6081
+ ])
+ 
+ dnl Option match
+@@ -955,7 +955,7 @@ Datapath actions: 2
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'recirc_id(0),tunnel(tun_id=0x0,src=1.1.1.1,dst=1.1.1.2,ttl=64,geneve({class=0xffff,type=1,len=0}),flags(df|key)),in_port(6081),skb_mark(0),eth_type(0x0800),ipv4(frag=no)'], [0], [stdout])
+ AT_CHECK([tail -2 stdout], [0],
+   [Megaflow: pkt_mark=0,recirc_id=0,ip,tun_id=0,tun_src=1.1.1.1,tun_dst=1.1.1.2,tun_tos=0,tun_flags=+df-csum+key,tun_metadata1,tun_metadata2=NP,in_port=1,nw_ecn=0,nw_frag=no
+-Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,geneve({class=0xffff,type=0x1,len=0}),flags(df|key))),6081
++Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,tp_dst=6081,geneve({class=0xffff,type=0x1,len=0}),flags(df|key))),6081
+ ])
+ 
+ OVS_VSWITCHD_STOP
+@@ -976,12 +976,12 @@ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ 
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(tun_id=0,src=1.1.1.1,dst=1.1.1.2,ttl=64),in_port(4789)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+-  [Datapath actions: set(tunnel(tun_id=0x0,ipv6_dst=2001:cafe::1,ttl=64,flags(df|key))),4789
++  [Datapath actions: set(tunnel(tun_id=0x0,ipv6_dst=2001:cafe::1,ttl=64,tp_dst=4789,flags(df|key))),4789
+ ])
+ 
+ AT_CHECK([ovs-appctl ofproto/trace ovs-dummy 'tunnel(tun_id=0x0,ipv6_src=2001:cafe::1,ipv6_dst=2001:cafe::2,ttl=64),in_port(4789)'], [0], [stdout])
+ AT_CHECK([tail -1 stdout], [0],
+-  [Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,flags(df|key))),4789
++  [Datapath actions: set(tunnel(tun_id=0x0,dst=1.1.1.1,ttl=64,tp_dst=4789,flags(df|key))),4789
+ ])
+ 
+ 
+-- 
+2.1.0
+

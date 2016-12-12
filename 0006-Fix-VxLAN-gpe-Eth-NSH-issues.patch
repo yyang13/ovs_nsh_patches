@@ -1,7 +1,7 @@
-From 16982ccaf9249550d01d1ef5d298f97ee6537eb0 Mon Sep 17 00:00:00 2001
+From 8bbeadfda03026028514dfb1b667126e8d233e12 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 27 Apr 2016 14:50:29 +0800
-Subject: [PATCH 6/7] Fix VxLAN-gpe + Eth + NSH issues
+Subject: [PATCH 6/8] Fix VxLAN-gpe + Eth + NSH issues
 
  - Set encap_eth_type to 0x894F on doing push_nsh
    in kernel data path
@@ -78,5 +78,5 @@ index 7721cc4..51f0545 100644
              }
  
 -- 
-1.9.3
+2.1.0
 

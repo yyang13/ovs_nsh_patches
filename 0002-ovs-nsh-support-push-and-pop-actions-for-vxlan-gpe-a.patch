@@ -1,7 +1,7 @@
-From bd251cb247ac44e4362215da826e9bf1d6c61f27 Mon Sep 17 00:00:00 2001
+From 4022104c9647a660a43680ac9e0173b4e7b65a73 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 13 Apr 2016 11:15:42 +0800
-Subject: [PATCH 2/7] ovs-nsh: support push and pop actions for vxlan-gpe and
+Subject: [PATCH 2/8] ovs-nsh: support push and pop actions for vxlan-gpe and
  Ethernet nsh
 
 Signed-off-by: Mengke Liu <mengke.liu@intel.com>
@@ -2742,5 +2742,5 @@ index 0c033da..d957574 100644
  OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=geneve \
                      options:remote_ip=1.1.1.1 ofport_request=1 \
 -- 
-1.9.3
+2.1.0
 

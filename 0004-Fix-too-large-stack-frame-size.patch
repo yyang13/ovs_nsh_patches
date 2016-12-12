@@ -1,7 +1,7 @@
-From e6f9b1f96a3ac4066c9d7d4c0a9da7e8abb1597f Mon Sep 17 00:00:00 2001
+From d0b6a5234f80301305123a7fbf09cdc2254bc09c Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Wed, 13 Apr 2016 18:17:21 +0800
-Subject: [PATCH 4/7] Fix too large stack frame size
+Subject: [PATCH 4/8] Fix too large stack frame size
 
 Signed-off-by: Yi Yang <yi.y.yang@intel.com>
 ---
@@ -260,5 +260,5 @@ index 5bec072..4baf242 100644
  }
  
 -- 
-1.9.3
+2.1.0
 

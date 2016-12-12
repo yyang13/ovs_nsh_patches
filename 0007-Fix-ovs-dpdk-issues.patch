@@ -1,7 +1,7 @@
-From faa1ed3acc3be170ce571a75e1ec03a09aca179e Mon Sep 17 00:00:00 2001
+From f0055aeafda4fc1ff60d76e18805f6df0f3b7499 Mon Sep 17 00:00:00 2001
 From: Yi Yang <yi.y.yang@intel.com>
 Date: Fri, 26 Aug 2016 09:21:20 +0800
-Subject: [PATCH 7/7] Fix ovs dpdk issues
+Subject: [PATCH 7/8] Fix ovs dpdk issues
 
  - Correct format_nsh error
  - Add Ethernet header for the NSH packet decapsulated from VxLAN-gpe port

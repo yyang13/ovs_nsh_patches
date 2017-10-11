@@ -1,0 +1,197 @@
+From 9b999eb51d9e1619b8a9835cfb031cd6fb8a6641 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 30 Nov 2016 12:22:19 +0800
+Subject: [PATCH 07/11] Change match field IDs and action IDs to adapt to ODL
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ include/openvswitch/meta-flow.h | 42 ++++++++++++++++++++---------------------
+ lib/ofp-actions.c               | 10 +++++-----
+ 2 files changed, 26 insertions(+), 26 deletions(-)
+
+diff --git a/include/openvswitch/meta-flow.h b/include/openvswitch/meta-flow.h
+index fa4129c..190c3d6 100644
+--- a/include/openvswitch/meta-flow.h
++++ b/include/openvswitch/meta-flow.h
+@@ -502,7 +502,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_TUN_GPE_NP(200) since v2.4.
++     * NXM: NXM_NX_TUN_GPE_NP(111) since v2.4.
+      * OXM: none.
+      */
+     MFF_TUN_GPE_NP,
+@@ -516,7 +516,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_TUN_GPE_FLAGS(201) since v2.4.
++     * NXM: NXM_NX_TUN_GPE_FLAGS(112) since v2.4.
+      * OXM: none.
+      */
+     MFF_TUN_GPE_FLAGS,
+@@ -966,14 +966,14 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_XXREG0(111) since v2.6.              <0>
+-     * NXM: NXM_NX_XXREG1(112) since v2.6.              <1>
+-     * NXM: NXM_NX_XXREG2(113) since v2.6.              <2>
+-     * NXM: NXM_NX_XXREG3(114) since v2.6.              <3>
+-     * NXM: NXM_NX_XXREG4(115) since vX.Y.              <4>
+-     * NXM: NXM_NX_XXREG5(116) since vX.Y.              <5>
+-     * NXM: NXM_NX_XXREG6(117) since vX.Y.              <6>
+-     * NXM: NXM_NX_XXREG7(118) since vX.Y.              <7>
++     * NXM: NXM_NX_XXREG0(124) since v2.6.              <0>
++     * NXM: NXM_NX_XXREG1(125) since v2.6.              <1>
++     * NXM: NXM_NX_XXREG2(126) since v2.6.              <2>
++     * NXM: NXM_NX_XXREG3(127) since v2.6.              <3>
++     * NXM: NXM_NX_XXREG4(128) since vX.Y.              <4>
++     * NXM: NXM_NX_XXREG5(129) since vX.Y.              <5>
++     * NXM: NXM_NX_XXREG6(130) since vX.Y.              <6>
++     * NXM: NXM_NX_XXREG7(131) since vX.Y.              <7>
+      * OXM: none.
+      */
+     MFF_XXREG0,
+@@ -1813,7 +1813,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSP(202) since v1.1.
++     * NXM: NXM_NX_NSP(113) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nsp.
+      */
+@@ -1829,7 +1829,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: decimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSI(203) since v1.1.
++     * NXM: NXM_NX_NSI(114) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nsi.
+      */
+@@ -1846,7 +1846,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSH_C1(204) since v1.1.
++     * NXM: NXM_NX_NSH_C1(115) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nshc1.
+      */
+@@ -1863,7 +1863,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSH_C2(205) since v1.1.
++     * NXM: NXM_NX_NSH_C2(116) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nshc2.
+      */
+@@ -1880,7 +1880,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSH_C3(206) since v1.1.
++     * NXM: NXM_NX_NSH_C3(117) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nshc3.
+      */
+@@ -1897,7 +1897,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSH_C4(207) since v1.1.
++     * NXM: NXM_NX_NSH_C4(118) since v1.1.
+      * OXM: none.
+      * Prefix lookup member: nshc4.
+      */
+@@ -1913,7 +1913,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: decimal.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_NSH_MDTYPE(208) since v1.1.
++     * NXM: NXM_NX_NSH_MDTYPE(119) since v1.1.
+      * OXM: none.
+      */
+     MFF_NSH_MDTYPE,
+@@ -1928,7 +1928,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+       * Formatting: decimal.
+       * Prerequisites: none.
+       * Access: read/write.
+-      * NXM: NXM_NX_NSH_NP(209) since v1.1.
++      * NXM: NXM_NX_NSH_NP(120) since v1.1.
+       * OXM: none.
+       */
+      MFF_NSH_NP,
+@@ -1942,7 +1942,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: Ethernet.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_ENCAP_ETH_SRC(210) since v1.1.
++     * NXM: NXM_NX_ENCAP_ETH_SRC(121) since v1.1.
+      * OXM: none.
+      */
+     MFF_ENCAP_ETH_SRC,
+@@ -1956,7 +1956,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: Ethernet.
+      * Prerequisites: none.
+      * Access: read/write.
+-     * NXM: NXM_NX_ENCAP_ETH_DST(211) since v1.1.
++     * NXM: NXM_NX_ENCAP_ETH_DST(122) since v1.1.
+      * OXM: none.
+      */
+     MFF_ENCAP_ETH_DST,
+@@ -1970,7 +1970,7 @@ enum OVS_PACKED_ENUM mf_field_id {
+      * Formatting: hexadecimal.
+      * Prerequisites: none.
+      * Access: read-only.
+-     * NXM: NXM_NX_ENCAP_ETH_TYPE(212) since v1.1.
++     * NXM: NXM_NX_ENCAP_ETH_TYPE(123) since v1.1.
+      * OXM: none.
+      */
+     MFF_ENCAP_ETH_TYPE,
+diff --git a/lib/ofp-actions.c b/lib/ofp-actions.c
+index 2935ca6..4939ef2 100644
+--- a/lib/ofp-actions.c
++++ b/lib/ofp-actions.c
+@@ -196,7 +196,7 @@ enum ofp_raw_action_type {
+     /* NX1.0(4), OF1.1+(21): uint32_t. */
+     OFPAT_RAW_SET_QUEUE,
+ 
+-    /* NX1.0(40), OF1.1+(22): uint32_t. */
++    /* NX1.0(42), OF1.1+(22): uint32_t. */
+     OFPAT_RAW_GROUP,
+ 
+     /* OF1.1+(23): uint8_t. */
+@@ -289,7 +289,7 @@ enum ofp_raw_action_type {
+ 
+     /* NX1.0+(29): struct nx_action_sample. */
+     NXAST_RAW_SAMPLE,
+-    /* NX1.0+(38): struct nx_action_sample2. */
++    /* NX1.0+(40): struct nx_action_sample2. */
+     NXAST_RAW_SAMPLE2,
+ 
+     /* NX1.0+(34): struct nx_action_conjunction. */
+@@ -301,13 +301,13 @@ enum ofp_raw_action_type {
+     /* NX1.0+(36): struct nx_action_nat, ... */
+     NXAST_RAW_NAT,
+ 
+-    /* NX1.0+(39): struct nx_action_output_trunc. */
++    /* NX1.0+(41): struct nx_action_output_trunc. */
+     NXAST_RAW_OUTPUT_TRUNC,
+ 
+-    /* NX1.0+(200): void. */
++    /* NX1.0+(38): void. */
+     NXAST_RAW_PUSH_NSH,
+ 
+-    /* NX1.0+(201): void. */
++    /* NX1.0+(39): void. */
+     NXAST_RAW_POP_NSH,
+ 
+ /* ## ------------------ ## */
+-- 
+1.8.3.1
+

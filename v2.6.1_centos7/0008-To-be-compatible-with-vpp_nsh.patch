@@ -1,0 +1,31 @@
+From df750763ae3914d870e715e2d71fd783b806f579 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 30 Nov 2016 17:27:11 +0800
+Subject: [PATCH 08/11] To be compatible with vpp_nsh
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ lib/netdev-native-tnl.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/lib/netdev-native-tnl.c b/lib/netdev-native-tnl.c
+index a677ec8..2dd4954 100644
+--- a/lib/netdev-native-tnl.c
++++ b/lib/netdev-native-tnl.c
+@@ -578,9 +578,10 @@ netdev_vxlan_build_header(const struct netdev *netdev,
+         put_16aligned_be32(&vxh->vx_flags, htonl(VXLAN_FLAGS | VXLAN_HF_GPE));
+         put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(params->flow->tunnel.tun_id) << 8));
+ 
+-        if (!params->flow->tunnel.gpe_np)
+-            gpe->next_protocol = VXLAN_GPE_NP_ETHERNET;
+-        else
++        if (!params->flow->tunnel.gpe_np) {
++            gpe->next_protocol = VXLAN_GPE_NP_NSH;
++            data->exts |= 1 << VXLAN_GPE_POP_ETH;
++        } else
+             gpe->next_protocol = params->flow->tunnel.gpe_np;
+ 
+         if (params->flow->tunnel.gpe_flags & 0x01)
+-- 
+1.8.3.1
+

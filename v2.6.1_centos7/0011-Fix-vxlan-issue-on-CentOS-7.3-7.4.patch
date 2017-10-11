@@ -1,0 +1,289 @@
+From 22711a289b78e9cba483a6ba51c1c7fe1af425da Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 11 Oct 2017 11:02:40 +0000
+Subject: [PATCH 11/11] Fix vxlan issue on CentOS 7.3/7.4
+
+CentOS 7.3/7.4 backported some kernel patches, so OVS will
+use upstream tunnel for CentOS 7.3/7.4, but our NSH patches
+need to use vxlan kernel modules in OVS tree, this patch
+forces OVS not to use upstream tunnel, it will use vxlan
+as well as vxlangpe in OVS tree, our NSH patches have
+some changes against them.
+
+This has been verified on CentOS 7.4.
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ acinclude.m4                                  | 10 ----------
+ datapath/flow_netlink.c                       |  2 +-
+ datapath/linux/compat/geneve.c                | 13 +++++++------
+ datapath/linux/compat/gso.h                   |  2 +-
+ datapath/linux/compat/include/net/dst_cache.h | 14 +++++++-------
+ datapath/linux/compat/ip_tunnels_core.c       |  2 ++
+ datapath/linux/compat/udp_tunnel.c            |  1 +
+ datapath/linux/compat/vxlan.c                 |  9 +++++----
+ 8 files changed, 24 insertions(+), 29 deletions(-)
+
+diff --git a/acinclude.m4 b/acinclude.m4
+index e6500d7..8ee7583 100644
+--- a/acinclude.m4
++++ b/acinclude.m4
+@@ -471,14 +471,6 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
+   dnl the stack has all required ipv6 support.
+   dnl OVS also does not need dst_cache But this dependency allows us to write
+   dnl much cleaner code.
+-
+-  OVS_FIND_FIELD_IFELSE([$KSRC/include/net/ip_tunnels.h], [ip_tunnel_key],
+-                        [label],
+-                        [OVS_GREP_IFELSE([$KSRC/include/net/ip_tunnels.h],
+-                                         [iptunnel_pull_offloads],
+-			[OVS_GREP_IFELSE([$KSRC/include/net/dst_cache.h], [dst_cache],
+-                                         [OVS_DEFINE([USE_UPSTREAM_TUNNEL])])])])
+-
+   OVS_GREP_IFELSE([$KSRC/include/linux/net.h], [sock_create_kern.*net],
+                   [OVS_DEFINE([HAVE_SOCK_CREATE_KERN_NET])])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_fill_metadata_dst])
+@@ -489,8 +481,6 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [__skb_gso_segment])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [can_checksum_protocol])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_get_iflink])
+-  OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_features_check],
+-                  [OVS_DEFINE([USE_UPSTREAM_TUNNEL_GSO])])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_add_vxlan_port])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [ndo_add_geneve_port])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [netdev_features_t])
+diff --git a/datapath/flow_netlink.c b/datapath/flow_netlink.c
+index 6952380..aaa63dd 100644
+--- a/datapath/flow_netlink.c
++++ b/datapath/flow_netlink.c
+@@ -2019,7 +2019,7 @@ static int validate_and_copy_set_tun(const struct nlattr *attr,
+ 	if (!tun_dst)
+ 		return -ENOMEM;
+ 
+-	err = dst_cache_init(&tun_dst->u.tun_info.dst_cache, GFP_KERNEL);
++	err = rpl_dst_cache_init(&tun_dst->u.tun_info.dst_cache, GFP_KERNEL);
+ 	if (err) {
+ 		dst_release((struct dst_entry *)tun_dst);
+ 		return err;
+diff --git a/datapath/linux/compat/geneve.c b/datapath/linux/compat/geneve.c
+index c08dced..aaf61b5 100644
+--- a/datapath/linux/compat/geneve.c
++++ b/datapath/linux/compat/geneve.c
+@@ -31,6 +31,7 @@
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6.h>
+ #include <net/addrconf.h>
++#include <net/gro_cells.h>
+ #include <net/ip6_tunnel.h>
+ #include <net/ip6_checksum.h>
+ #endif
+@@ -310,7 +311,7 @@ static int geneve_init(struct net_device *dev)
+ 	if (!dev->tstats)
+ 		return -ENOMEM;
+ 
+-	err = dst_cache_init(&geneve->dst_cache, GFP_KERNEL);
++	err = rpl_dst_cache_init(&geneve->dst_cache, GFP_KERNEL);
+ 	if (err) {
+ 		free_percpu(dev->tstats);
+ 		return err;
+@@ -323,7 +324,7 @@ static void geneve_uninit(struct net_device *dev)
+ {
+ 	struct geneve_dev *geneve = netdev_priv(dev);
+ 
+-	dst_cache_destroy(&geneve->dst_cache);
++	rpl_dst_cache_destroy(&geneve->dst_cache);
+ 	free_percpu(dev->tstats);
+ }
+ 
+@@ -871,7 +872,7 @@ static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
+ 	}
+ 
+ 	if (use_cache) {
+-		rt = dst_cache_get_ip4(dst_cache, &fl4->saddr);
++		rt = rpl_dst_cache_get_ip4(dst_cache, &fl4->saddr);
+ 		if (rt)
+ 			return rt;
+ 	}
+@@ -887,7 +888,7 @@ static struct rtable *geneve_get_v4_rt(struct sk_buff *skb,
+ 		return ERR_PTR(-ELOOP);
+ 	}
+ 	if (use_cache)
+-		dst_cache_set_ip4(dst_cache, &rt->dst, fl4->saddr);
++		rpl_dst_cache_set_ip4(dst_cache, &rt->dst, fl4->saddr);
+ 	return rt;
+ }
+ 
+@@ -934,7 +935,7 @@ static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
+ 	}
+ 
+ 	if (use_cache) {
+-		dst = dst_cache_get_ip6(dst_cache, &fl6->saddr);
++		dst = rpl_dst_cache_get_ip6(dst_cache, &fl6->saddr);
+ 		if (dst)
+ 			return dst;
+ 	}
+@@ -958,7 +959,7 @@ static struct dst_entry *geneve_get_v6_dst(struct sk_buff *skb,
+ 	}
+ 
+ 	if (use_cache)
+-		dst_cache_set_ip6(dst_cache, dst, &fl6->saddr);
++		rpl_dst_cache_set_ip6(dst_cache, dst, &fl6->saddr);
+ 	return dst;
+ }
+ #endif
+diff --git a/datapath/linux/compat/gso.h b/datapath/linux/compat/gso.h
+index 2e9dbb3..10429a5 100644
+--- a/datapath/linux/compat/gso.h
++++ b/datapath/linux/compat/gso.h
+@@ -155,7 +155,7 @@ static inline void ovs_dst_release(struct dst_entry *dst)
+ {
+ 	struct metadata_dst *tun_dst = (struct metadata_dst *) dst;
+ 
+-	dst_cache_destroy(&tun_dst->u.tun_info.dst_cache);
++	rpl_dst_cache_destroy(&tun_dst->u.tun_info.dst_cache);
+ 	kfree(dst);
+ }
+ 
+diff --git a/datapath/linux/compat/include/net/dst_cache.h b/datapath/linux/compat/include/net/dst_cache.h
+index ff4d83b..5a60712 100644
+--- a/datapath/linux/compat/include/net/dst_cache.h
++++ b/datapath/linux/compat/include/net/dst_cache.h
+@@ -24,7 +24,7 @@ struct dst_cache {
+  *	source address to be used when xmitting to the cached dst.
+  *	local BH must be disabled.
+  */
+-#define rpl_dst_cache_get dst_cache_get
++//#define rpl_dst_cache_get dst_cache_get
+ struct dst_entry *rpl_dst_cache_get(struct dst_cache *dst_cache);
+ 
+ /**
+@@ -34,7 +34,7 @@ struct dst_entry *rpl_dst_cache_get(struct dst_cache *dst_cache);
+  *
+  *	local BH must be disabled.
+  */
+-#define rpl_dst_cache_get_ip4 dst_cache_get_ip4
++//#define rpl_dst_cache_get_ip4 dst_cache_get_ip4
+ struct rtable *rpl_dst_cache_get_ip4(struct dst_cache *dst_cache, __be32 *saddr);
+ 
+ /**
+@@ -45,7 +45,7 @@ struct rtable *rpl_dst_cache_get_ip4(struct dst_cache *dst_cache, __be32 *saddr)
+  *
+  *	local BH must be disabled.
+  */
+-#define rpl_dst_cache_set_ip4 dst_cache_set_ip4
++//#define rpl_dst_cache_set_ip4 dst_cache_set_ip4
+ void rpl_dst_cache_set_ip4(struct dst_cache *dst_cache, struct dst_entry *dst,
+ 		       __be32 saddr);
+ 
+@@ -59,7 +59,7 @@ void rpl_dst_cache_set_ip4(struct dst_cache *dst_cache, struct dst_entry *dst,
+  *
+  *	local BH must be disabled.
+  */
+-#define rpl_dst_cache_set_ip6 dst_cache_set_ip6
++//#define rpl_dst_cache_set_ip6 dst_cache_set_ip6
+ void rpl_dst_cache_set_ip6(struct dst_cache *dst_cache, struct dst_entry *dst,
+ 		       const struct in6_addr *addr);
+ 
+@@ -70,7 +70,7 @@ void rpl_dst_cache_set_ip6(struct dst_cache *dst_cache, struct dst_entry *dst,
+  *
+  *	local BH must be disabled.
+  */
+-#define rpl_dst_cache_get_ip6 dst_cache_get_ip6
++//#define rpl_dst_cache_get_ip6 dst_cache_get_ip6
+ struct dst_entry *rpl_dst_cache_get_ip6(struct dst_cache *dst_cache,
+ 				    struct in6_addr *saddr);
+ #endif
+@@ -92,7 +92,7 @@ static inline void dst_cache_reset(struct dst_cache *dst_cache)
+  *	@dst_cache: the cache
+  *	@gfp: allocation flags
+  */
+-#define rpl_dst_cache_init dst_cache_init
++//#define rpl_dst_cache_init dst_cache_init
+ int rpl_dst_cache_init(struct dst_cache *dst_cache, gfp_t gfp);
+ 
+ /**
+@@ -102,7 +102,7 @@ int rpl_dst_cache_init(struct dst_cache *dst_cache, gfp_t gfp);
+  *	No synchronization is enforced: it must be called only when the cache
+  *	is unsed.
+  */
+-#define rpl_dst_cache_destroy dst_cache_destroy
++//#define rpl_dst_cache_destroy dst_cache_destroy
+ void rpl_dst_cache_destroy(struct dst_cache *dst_cache);
+ 
+ #endif /* USE_UPSTREAM_TUNNEL */
+diff --git a/datapath/linux/compat/ip_tunnels_core.c b/datapath/linux/compat/ip_tunnels_core.c
+index 7ade6c1..0039e6d 100644
+--- a/datapath/linux/compat/ip_tunnels_core.c
++++ b/datapath/linux/compat/ip_tunnels_core.c
+@@ -29,6 +29,8 @@
+ #include <linux/version.h>
+ #include <linux/workqueue.h>
+ #include <linux/rculist.h>
++#include <net/gro_cells.h>
++#include <net/dst_metadata.h>
+ #include <net/ip_tunnels.h>
+ #include <net/ip6_tunnel.h>
+ #include <net/route.h>
+diff --git a/datapath/linux/compat/udp_tunnel.c b/datapath/linux/compat/udp_tunnel.c
+index 23801bb..5fc1d7c 100644
+--- a/datapath/linux/compat/udp_tunnel.c
++++ b/datapath/linux/compat/udp_tunnel.c
+@@ -8,6 +8,7 @@
+ #include <linux/udp.h>
+ #include <linux/types.h>
+ #include <linux/kernel.h>
++#include <net/gro_cells.h>
+ #include <net/ip_tunnels.h>
+ #include <net/udp.h>
+ #include <net/udp_tunnel.h>
+diff --git a/datapath/linux/compat/vxlan.c b/datapath/linux/compat/vxlan.c
+index a80610b..ebccccb 100644
+--- a/datapath/linux/compat/vxlan.c
++++ b/datapath/linux/compat/vxlan.c
+@@ -47,6 +47,7 @@
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6.h>
+ #include <net/addrconf.h>
++#include <net/gro_cells.h>
+ #include <net/ip6_tunnel.h>
+ #include <net/ip6_checksum.h>
+ #include <net/ip6_route.h>
+@@ -921,7 +922,7 @@ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
+ 	if (tos && !info)
+ 		use_cache = false;
+ 	if (use_cache) {
+-		rt = dst_cache_get_ip4(dst_cache, saddr);
++		rt = rpl_dst_cache_get_ip4(dst_cache, saddr);
+ 		if (rt)
+ 			return rt;
+ 	}
+@@ -938,7 +939,7 @@ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
+ 	if (!IS_ERR(rt)) {
+ 		*saddr = fl4.saddr;
+ 		if (use_cache)
+-			dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
++			rpl_dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
+ 	}
+ 	return rt;
+ }
+@@ -964,7 +965,7 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
+ 	if (tos && !info)
+ 		use_cache = false;
+ 	if (use_cache) {
+-		ndst = dst_cache_get_ip6(dst_cache, saddr);
++		ndst = rpl_dst_cache_get_ip6(dst_cache, saddr);
+ 		if (ndst)
+ 			return ndst;
+ 	}
+@@ -994,7 +995,7 @@ static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
+ 
+ 	*saddr = fl6.saddr;
+ 	if (use_cache)
+-		dst_cache_set_ip6(dst_cache, ndst, saddr);
++		rpl_dst_cache_set_ip6(dst_cache, ndst, saddr);
+ 	return ndst;
+ }
+ #endif
+-- 
+1.8.3.1
+

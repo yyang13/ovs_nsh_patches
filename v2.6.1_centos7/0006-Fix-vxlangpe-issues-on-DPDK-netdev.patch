@@ -1,0 +1,127 @@
+From 0ed8c2747aaeabc1d508e8a05bd33a37a14a7f42 Mon Sep 17 00:00:00 2001
+From: Yi Yang <yi.y.yang@intel.com>
+Date: Wed, 30 Nov 2016 10:22:57 +0800
+Subject: [PATCH 06/11] Fix vxlangpe issues on DPDK netdev
+
+ - Fix a potential deadlock issue
+ - Use Ethernet header before NSH header in VxLAN-gpe
+   to ensure we have uniform behaviour in OVS DPDK and
+   OVS
+ - Correct VxLAN-gpe check in netdev_vxlan_pop_header
+
+Signed-off-by: Yi Yang <yi.y.yang@intel.com>
+---
+ lib/dpif-netdev.c       |  5 +----
+ lib/netdev-native-tnl.c |  9 +++++----
+ lib/netdev-vport.c      | 10 ++++++++++
+ lib/netdev-vport.h      |  2 ++
+ ofproto/tunnel.c        |  1 -
+ 5 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index c779c78..257a174 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -1217,11 +1217,8 @@ static void add_vxlan_gpe_exts(struct netdev *netdev, uint32_t exts)
+ {
+     const char *type = netdev_get_type(netdev);
+     if (!strcmp(type, "vxlan")) {
+-        struct netdev_tunnel_config *cfg;
+-        cfg = netdev_get_tunnel_config(netdev);
+-
+         if(exts & (1 << OVS_VXLAN_EXT_GPE))
+-            cfg->exts |= (1 << OVS_VXLAN_EXT_GPE);
++            netdev_set_tunnel_config_exts(netdev, exts);
+     }
+ }
+ 
+diff --git a/lib/netdev-native-tnl.c b/lib/netdev-native-tnl.c
+index 2fe2722..a677ec8 100644
+--- a/lib/netdev-native-tnl.c
++++ b/lib/netdev-native-tnl.c
+@@ -243,6 +243,7 @@ eth_build_header(struct ovs_action_push_tnl *data,
+     uint16_t eth_proto = params->is_ipv6 ? ETH_TYPE_IPV6 : ETH_TYPE_IP;
+     struct eth_header *eth;
+ 
++    data->exts = 0;
+     memset(data->header, 0, sizeof data->header);
+ 
+     eth = (struct eth_header *)data->header;
+@@ -499,9 +500,9 @@ netdev_vxlan_pop_header(struct dp_packet *packet)
+     flag = get_16aligned_be32(&vxh->vx_flags);
+     vni = get_16aligned_be32(&vxh->vx_vni);
+ 
+-    if (flag & VXLAN_HF_GPE) {
+-        flag &= ~VXLAN_GPE_USED_BITS;
+-        if ((flag & ~VXLAN_GPE_USED_BITS) ||
++    if (flag & htonl(VXLAN_HF_GPE)) {
++        flag &= htonl(~VXLAN_GPE_USED_BITS);
++        if ((flag != htonl(VXLAN_FLAGS)) ||
+             (vni & htonl(0xff))) {
+ 
+             VLOG_WARN_RL(&err_rl, "invalid vxlan flags=%#x vni=%#x\n for vxlan-gpe",
+@@ -578,7 +579,7 @@ netdev_vxlan_build_header(const struct netdev *netdev,
+         put_16aligned_be32(&vxh->vx_vni, htonl(ntohll(params->flow->tunnel.tun_id) << 8));
+ 
+         if (!params->flow->tunnel.gpe_np)
+-            return -1;
++            gpe->next_protocol = VXLAN_GPE_NP_ETHERNET;
+         else
+             gpe->next_protocol = params->flow->tunnel.gpe_np;
+ 
+diff --git a/lib/netdev-vport.c b/lib/netdev-vport.c
+index 841a070..0aca632 100644
+--- a/lib/netdev-vport.c
++++ b/lib/netdev-vport.c
+@@ -85,6 +85,16 @@ get_netdev_tunnel_config(const struct netdev *netdev)
+     return &netdev_vport_cast(netdev)->tnl_cfg;
+ }
+ 
++void netdev_set_tunnel_config_exts(struct netdev *netdev, uint32_t exts)
++{
++    struct netdev_vport *dev = netdev_vport_cast(netdev);
++    dev->tnl_cfg.exts = exts;
++    ovs_mutex_lock(&dev->mutex);
++    tunnel_check_status_change__(dev);
++    netdev_change_seq_changed(netdev);
++    ovs_mutex_unlock(&dev->mutex);
++}
++
+ bool
+ netdev_vport_is_patch(const struct netdev *netdev)
+ {
+diff --git a/lib/netdev-vport.h b/lib/netdev-vport.h
+index b19cbd2..e093dde 100644
+--- a/lib/netdev-vport.h
++++ b/lib/netdev-vport.h
+@@ -19,6 +19,7 @@
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <inttypes.h>
+ #include "compiler.h"
+ 
+ struct dpif_netlink_vport;
+@@ -42,6 +43,7 @@ void netdev_vport_inc_tx(const struct netdev *,
+ 
+ bool netdev_vport_is_vport_class(const struct netdev_class *);
+ const char *netdev_vport_class_get_dpif_port(const struct netdev_class *);
++void netdev_set_tunnel_config_exts(struct netdev *netdev, uint32_t exts);
+ 
+ #ifndef _WIN32
+ enum { NETDEV_VPORT_NAME_BUFSIZE = 16 };
+diff --git a/ofproto/tunnel.c b/ofproto/tunnel.c
+index acaec82..9a69071 100644
+--- a/ofproto/tunnel.c
++++ b/ofproto/tunnel.c
+@@ -701,7 +701,6 @@ tnl_port_build_header(const struct ofport_dpif *ofport,
+     tnl_port = tnl_find_ofport(ofport);
+     ovs_assert(tnl_port);
+     res = netdev_build_header(tnl_port->netdev, data, params);
+-    data->exts = 0;
+     fat_rwlock_unlock(&rwlock);
+ 
+     return res;
+-- 
+1.8.3.1
+

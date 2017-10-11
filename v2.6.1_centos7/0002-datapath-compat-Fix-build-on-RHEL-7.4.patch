@@ -1,0 +1,52 @@
+From 5a35f48e3838277bb7b400b0f7723e309cb48a16 Mon Sep 17 00:00:00 2001
+From: Yi-Hung Wei <yihung.wei@gmail.com>
+Date: Tue, 22 Aug 2017 17:52:29 -0700
+Subject: [PATCH 02/11] datapath: compat: Fix build on RHEL 7.4
+
+RHEL 7.4 introduces netdev_master_upper_dev_link_rh() that breaks the
+backport of OVS kernel module on RHEL 7.4. This patch fixes that issue.
+
+Signed-off-by: Yi-Hung Wei <yihung.wei@gmail.com>
+Signed-off-by: Joe Stringer <joe@ovn.org>
+---
+ acinclude.m4                                    | 3 +++
+ datapath/linux/compat/include/linux/netdevice.h | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/acinclude.m4 b/acinclude.m4
+index b7ad0de..e6500d7 100644
+--- a/acinclude.m4
++++ b/acinclude.m4
+@@ -510,6 +510,9 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
+   OVS_FIND_PARAM_IFELSE([$KSRC/include/linux/netdevice.h],
+                         [netdev_master_upper_dev_link], [upper_priv],
+                         [OVS_DEFINE([HAVE_NETDEV_MASTER_UPPER_DEV_LINK_PRIV])])
++  OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h],
++                  [netdev_master_upper_dev_link_rh],
++                  [OVS_DEFINE([HAVE_NETDEV_MASTER_UPPER_DEV_LINK_RH])])
+ 
+   OVS_GREP_IFELSE([$KSRC/include/linux/netfilter.h], [nf_hook_state])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netfilter.h], [nf_register_net_hook])
+diff --git a/datapath/linux/compat/include/linux/netdevice.h b/datapath/linux/compat/include/linux/netdevice.h
+index 9982fd7..3b3ea17 100644
+--- a/datapath/linux/compat/include/linux/netdevice.h
++++ b/datapath/linux/compat/include/linux/netdevice.h
+@@ -106,6 +106,7 @@ static inline bool netif_needs_gso(struct sk_buff *skb,
+ #endif
+ 
+ #ifndef HAVE_NETDEV_MASTER_UPPER_DEV_LINK_PRIV
++#ifndef HAVE_NETDEV_MASTER_UPPER_DEV_LINK_RH
+ static inline int rpl_netdev_master_upper_dev_link(struct net_device *dev,
+ 					       struct net_device *upper_dev,
+ 					       void *upper_priv, void *upper_info)
+@@ -115,6 +116,7 @@ static inline int rpl_netdev_master_upper_dev_link(struct net_device *dev,
+ #define netdev_master_upper_dev_link rpl_netdev_master_upper_dev_link
+ 
+ #endif
++#endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3,16,0)
+ #define dev_queue_xmit rpl_dev_queue_xmit
+-- 
+1.8.3.1
+

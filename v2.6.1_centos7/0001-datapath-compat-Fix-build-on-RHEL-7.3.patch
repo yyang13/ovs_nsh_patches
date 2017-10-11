@@ -1,0 +1,190 @@
+From e112dad5f011528f9e1f30f225fb1e2017895c70 Mon Sep 17 00:00:00 2001
+From: Yi-Hung Wei <yihung.wei@gmail.com>
+Date: Thu, 8 Dec 2016 18:34:05 -0800
+Subject: [PATCH 01/11] datapath: compat: Fix build on RHEL 7.3
+
+RHEL 7.3 provides upstream tunnel but it does not support name_assign_type
+attribute in net-device. This patch fixes the build problem by backporting
+functions with name_assign_type, and using proper flags in acinclude.m4 to
+invoke backport functions.
+
+Tested on RHEL 7.3 with kernel 3.10.0-514.el7.x86_64
+
+Signed-off-by: Yi-Hung Wei <yihung.wei@gmail.com>
+Signed-off-by: Joe Stringer <joe@ovn.org>
+---
+ acinclude.m4                                    |  7 +++++++
+ datapath/linux/compat/include/linux/netdevice.h |  3 ++-
+ datapath/linux/compat/include/net/geneve.h      | 10 ++++++++++
+ datapath/linux/compat/include/net/gre.h         | 10 ++++++++++
+ datapath/linux/compat/include/net/inet_frag.h   |  9 ++++++---
+ datapath/linux/compat/include/net/vxlan.h       | 11 +++++++++++
+ datapath/vport-internal_dev.c                   |  4 ++++
+ 7 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/acinclude.m4 b/acinclude.m4
+index 2c500a8..b7ad0de 100644
+--- a/acinclude.m4
++++ b/acinclude.m4
+@@ -458,6 +458,11 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
+   OVS_FIND_FIELD_IFELSE([$KSRC/include/net/inet_frag.h], [inet_frag_queue],
+                         [list_evictor])
+   OVS_GREP_IFELSE([$KSRC/include/net/inet_frag.h], [inet_frag_lru_move])
++  OVS_FIND_PARAM_IFELSE([$KSRC/include/net/inet_frag.h],
++                        [sub_frag_mem_limit], [struct.netns_frags],
++                        [OVS_DEFINE([HAVE_SUB_FRAG_MEM_LIMIT_ARG_STRUCT_NETNS_FRAGS])])
++  OVS_GREP_IFELSE([$KSRC/include/net/inet_frag.h], [void.*inet_frags_init],
++                  [OVS_DEFINE([HAVE_VOID_INET_FRAGS_INIT])])
+   OVS_GREP_IFELSE([$KSRC/include/net/inetpeer.h], [vif],
+                   [OVS_DEFINE([HAVE_INETPEER_VIF_SUPPORT])])
+ 
+@@ -500,6 +505,8 @@ AC_DEFUN([OVS_CHECK_LINUX_COMPAT], [
+                   [OVS_DEFINE([HAVE_UDP_OFFLOAD_ARG_UOFF])])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [gro_remcsum])
+   OVS_GREP_IFELSE([$KSRC/include/linux/netdevice.h], [IFF_PHONY_HEADROOM])
++  OVS_FIND_FIELD_IFELSE([$KSRC/include/linux/netdevice.h], [net_device_ops],
++                        [extended])
+   OVS_FIND_PARAM_IFELSE([$KSRC/include/linux/netdevice.h],
+                         [netdev_master_upper_dev_link], [upper_priv],
+                         [OVS_DEFINE([HAVE_NETDEV_MASTER_UPPER_DEV_LINK_PRIV])])
+diff --git a/datapath/linux/compat/include/linux/netdevice.h b/datapath/linux/compat/include/linux/netdevice.h
+index dd028f6..9982fd7 100644
+--- a/datapath/linux/compat/include/linux/netdevice.h
++++ b/datapath/linux/compat/include/linux/netdevice.h
+@@ -122,10 +122,11 @@ int rpl_dev_queue_xmit(struct sk_buff *skb);
+ #endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3,11,0)
+-static inline struct net_device *netdev_notifier_info_to_dev(void *info)
++static inline struct net_device *rpl_netdev_notifier_info_to_dev(void *info)
+ {
+ 	return info;
+ }
++#define netdev_notifier_info_to_dev rpl_netdev_notifier_info_to_dev
+ #endif
+ 
+ #ifndef HAVE_PCPU_SW_NETSTATS
+diff --git a/datapath/linux/compat/include/net/geneve.h b/datapath/linux/compat/include/net/geneve.h
+index 857c6d7..d9c9f0b 100644
+--- a/datapath/linux/compat/include/net/geneve.h
++++ b/datapath/linux/compat/include/net/geneve.h
+@@ -18,6 +18,16 @@ static inline void rpl_geneve_cleanup_module(void)
+ 
+ #define geneve_xmit dev_queue_xmit
+ 
++#ifdef CONFIG_INET
++#ifndef HAVE_NAME_ASSIGN_TYPE
++static inline struct net_device *rpl_geneve_dev_create_fb(
++	struct net *net, const char *name, u8 name_assign_type, u16 dst_port) {
++	return geneve_dev_create_fb(net, name, dst_port);
++}
++#define geneve_dev_create_fb rpl_geneve_dev_create_fb
++#endif
++#endif
++
+ #else
+ /* Geneve Header:
+  *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+diff --git a/datapath/linux/compat/include/net/gre.h b/datapath/linux/compat/include/net/gre.h
+index 4a78fe8..764b9f1 100644
+--- a/datapath/linux/compat/include/net/gre.h
++++ b/datapath/linux/compat/include/net/gre.h
+@@ -17,6 +17,16 @@ static inline void rpl_ipgre_fini(void)
+ 
+ #define gre_fb_xmit dev_queue_xmit
+ 
++#ifdef CONFIG_INET
++#ifndef HAVE_NAME_ASSIGN_TYPE
++static inline struct net_device *rpl_gretap_fb_dev_create(
++	struct net *net, const char *name, u8 name_assign_type) {
++	return gretap_fb_dev_create(net, name);
++}
++#define gretap_fb_dev_create rpl_gretap_fb_dev_create
++#endif
++#endif
++
+ #else
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37) || \
+diff --git a/datapath/linux/compat/include/net/inet_frag.h b/datapath/linux/compat/include/net/inet_frag.h
+index c37bc84..01d79ad 100644
+--- a/datapath/linux/compat/include/net/inet_frag.h
++++ b/datapath/linux/compat/include/net/inet_frag.h
+@@ -29,7 +29,7 @@ static inline bool inet_frag_evicting(struct inet_frag_queue *q)
+ #define inet_frag_lru_move(q)
+ #endif
+ 
+-#ifndef HAVE_CORRECT_MRU_HANDLING
++#ifndef HAVE_SUB_FRAG_MEM_LIMIT_ARG_STRUCT_NETNS_FRAGS
+ static inline void rpl_sub_frag_mem_limit(struct netns_frags *nf, int i)
+ {
+ 	__percpu_counter_add(&nf->mem, -i, frag_percpu_counter_batch);
+@@ -41,14 +41,18 @@ static inline void rpl_add_frag_mem_limit(struct netns_frags *nf, int i)
+ 	__percpu_counter_add(&nf->mem, i, frag_percpu_counter_batch);
+ }
+ #define add_frag_mem_limit rpl_add_frag_mem_limit
++#endif
+ 
++#ifdef HAVE_VOID_INET_FRAGS_INIT
+ static inline int rpl_inet_frags_init(struct inet_frags *frags)
+ {
+ 	inet_frags_init(frags);
+ 	return 0;
+ }
+ #define inet_frags_init rpl_inet_frags_init
++#endif
+ 
++#ifndef HAVE_CORRECT_MRU_HANDLING
+ /* We reuse the upstream inet_fragment.c common code for managing fragment
+  * stores, However we actually store the fragments within our own 'inet_frags'
+  * structures (in {ip_fragment,nf_conntrack_reasm}.c). When unloading the OVS
+@@ -64,7 +68,6 @@ static inline int rpl_inet_frags_init(struct inet_frags *frags)
+  */
+ void rpl_inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f);
+ #define inet_frags_exit_net rpl_inet_frags_exit_net
+-
+-#endif /* !HAVE_CORRECT_MRU_HANDLING */
++#endif
+ 
+ #endif /* inet_frag.h */
+diff --git a/datapath/linux/compat/include/net/vxlan.h b/datapath/linux/compat/include/net/vxlan.h
+index 5bc8969..460fbf2 100644
+--- a/datapath/linux/compat/include/net/vxlan.h
++++ b/datapath/linux/compat/include/net/vxlan.h
+@@ -17,6 +17,17 @@ static inline void rpl_vxlan_cleanup_module(void)
+ 
+ #define vxlan_xmit dev_queue_xmit
+ 
++#ifdef CONFIG_INET
++#ifndef HAVE_NAME_ASSIGN_TYPE
++static inline struct net_device *rpl_vxlan_dev_create(
++	struct net *net, const char *name, u8 name_assign_type,
++	struct vxlan_config *conf) {
++	return vxlan_dev_create(net, name, conf);
++}
++#define vxlan_dev_create rpl_vxlan_dev_create
++#endif
++#endif
++
+ #else /* USE_UPSTREAM_TUNNEL */
+ 
+ #include <linux/ip.h>
+diff --git a/datapath/vport-internal_dev.c b/datapath/vport-internal_dev.c
+index 482af37..cc01c9c 100644
+--- a/datapath/vport-internal_dev.c
++++ b/datapath/vport-internal_dev.c
+@@ -153,7 +153,11 @@ static const struct net_device_ops internal_dev_netdev_ops = {
+ 	.ndo_change_mtu = internal_dev_change_mtu,
+ 	.ndo_get_stats64 = internal_get_stats,
+ #ifdef HAVE_IFF_PHONY_HEADROOM
++#ifndef HAVE_NET_DEVICE_OPS_WITH_EXTENDED
+ 	.ndo_set_rx_headroom = internal_set_rx_headroom,
++#else
++	.extended.ndo_set_rx_headroom = internal_set_rx_headroom,
++#endif
+ #endif
+ };
+ 
+-- 
+1.8.3.1
+
